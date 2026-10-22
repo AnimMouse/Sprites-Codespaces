@@ -1,0 +1,32 @@
+# sprite-codespace config — copy to ~/.config/sprite-codespace/config
+# Plain shell assignments; every line is optional.
+
+# Sprites org, if you belong to more than one (default: the CLI's selected org).
+#SPRITE_ORG=
+
+# Prefix that marks a sprite as a codespace. `list` shows only these.
+#SPRITE_PREFIX=cs-
+
+# auto (default): devcontainer when the repo has a devcontainer.json, else native.
+#DEFAULT_MODE=auto
+
+# Git identity inside codespaces. Defaults to your local `git config user.*`.
+#GIT_NAME="Anim Mouse"
+#GIT_EMAIL=you@example.com
+
+# Commit signing: a passphrase-less SSH private key, copied to each codespace.
+# Add its .pub on GitHub as a *Signing key*. Leave unset to not sign.
+#SIGNING_KEY=$HOME/.ssh/id_ed25519
+
+# Dotfiles, exactly as in Codespaces settings. Private repos work: the clone
+# uses GH_TOKEN.
+#DOTFILES_REPOSITORY=AnimMouse/dotfiles-codespaces
+#DOTFILES_INSTALL_COMMAND=install.sh
+
+#TIMEZONE=Asia/Manila
+
+# Pin code-server; default is the newest release.
+#CODE_SERVER_VERSION=4.141.0
+
+# Image for --devcontainer on a repo with no devcontainer.json.
+#DEFAULT_IMAGE=mcr.microsoft.com/devcontainers/base:ubuntu26.04

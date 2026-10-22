@@ -1,0 +1,301 @@
+#!/usr/bin/env bash
+# sprite-codespace — GitHub Codespaces, on Fly.io Sprites.
+#
+# One sprite per codespace. Its URL, https://<sprite>-<org>.sprites.app, is a
+# VS Code (code-server) editor on the repo, behind the sprite's own Fly.io
+# login. Runs on your machine; everything it does to the sprite goes through
+# the `sprite` CLI, so you need to have run `sprite login` once.
+#
+#   sprite-codespace create <repo> [--name N] [--mode auto|native|devcontainer]
+#   sprite-codespace new <name> [--mode ...]     an empty workspace, no repo
+#   sprite-codespace list                        codespaces and their URLs
+#   sprite-codespace open <name>                 open the editor in a browser
+#   sprite-codespace shell <name> [-- cmd]       a terminal in the workspace
+#   sprite-codespace sync <name>                 re-push secrets, gh token, config
+#   sprite-codespace rebuild <name>              recreate the dev container
+#   sprite-codespace logs <name>                 editor logs, when the URL fails
+#   sprite-codespace checkpoint <name> [comment] snapshot the whole sprite
+#   sprite-codespace rm <name>                   destroy the sprite (asks first)
+#
+# <repo> is owner/repo, github.com/owner/repo, or any git URL.
+# <name> is the codespace name or the full sprite name.
+
+set -euo pipefail
+
+HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+AGENT="$HERE/sprite/codespace"
+CONF_DIR="${SPRITE_CODESPACE_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/sprite-codespace}"
+PREFIX_DEFAULT=cs-
+
+die() { echo "sprite-codespace: $*" >&2; exit 1; }
+note() { echo "==> $*" >&2; }
+
+usage() { sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//' >&2; exit "${1:-1}"; }
+
+load_config() {
+  # Your own file, so sourcing it is fine. See config.example.
+  # shellcheck source=/dev/null
+  [ -r "$CONF_DIR/config" ] && . "$CONF_DIR/config"
+  PREFIX="${SPRITE_PREFIX-$PREFIX_DEFAULT}"
+  SPRITE_ARGS=()
+  [ -n "${SPRITE_ORG:-}" ] && SPRITE_ARGS+=(-o "$SPRITE_ORG")
+  return 0
+}
+
+command -v sprite >/dev/null || die "the sprite CLI is not installed — https://sprites.dev"
+command -v jq >/dev/null || die "jq is required"
+
+slugify() { echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's![^a-z0-9-]!-!g; s!--*!-!g; s!^-*!!; s!-*$!!'; }
+
+# "web" -> "cs-web"; "cs-web" stays as it is.
+sprite_name() {
+  local n; n=$(slugify "$1")
+  case "$n" in "$PREFIX"*) echo "$n" ;; *) echo "$PREFIX$n" ;; esac
+}
+
+sp() { sprite "${SPRITE_ARGS[@]}" "$@"; }
+
+sprite_json() { sp --json list | jq -c --arg n "$1" '.sprites[]? | select(.name == $n)'; }
+
+require_sprite() {
+  [ -n "$(sprite_json "$1")" ] || die "no sprite named $1 — 'sprite-codespace list'"
+}
+
+# The editor runs with --auth none: the sprite URL's Fly.io login is the only
+# lock on the door. Refuse to put an editor behind a URL anyone can open.
+require_private_url() {
+  local auth
+  auth=$(sprite_json "$1" | jq -r '.url_settings.auth // "sprite"')
+  [ "$auth" = public ] && die "$1's URL is public — anyone could open the editor. Run: sprite config update --url-auth sprite -s $1"
+  return 0
+}
+
+normalize_url() {
+  case "$1" in
+    *://*|*@*:*) echo "$1" ;;
+    github.com/*|gitlab.com/*) echo "https://$1" ;;
+    */*) echo "https://github.com/$1" ;;
+    *) die "'$1' is not a repo — give owner/repo or a git URL" ;;
+  esac
+}
+
+# KEY=value lines: the global secrets file, then <name>.secrets on top, like
+# Codespaces' user secrets with a per-repo override. GH_TOKEN defaults to
+# `gh auth token`, which is what lets git push and gh work inside.
+stage_secrets() {
+  local name="$1" out="$2" f
+  : > "$out"; chmod 600 "$out"
+  for f in "$CONF_DIR/secrets" "$CONF_DIR/$name.secrets"; do
+    [ -r "$f" ] || continue
+    case "$(stat -c %a "$f" 2>/dev/null || stat -f %Lp "$f")" in
+      600|400) ;;
+      *) note "warning: $f is readable by others; chmod 600 it" ;;
+    esac
+    grep -E '^[A-Za-z_][A-Za-z0-9_]*=' "$f" >> "$out" || true
+  done
+  # Later lines win, so the per-codespace file overrides the global one.
+  awk -F= '{ v[$1] = $0; if (!($1 in seen)) { seen[$1]; order[++n] = $1 } }
+           END { for (i = 1; i <= n; i++) print v[order[i]] }' "$out" > "$out.tmp"
+  mv "$out.tmp" "$out"; chmod 600 "$out"
+
+  if ! grep -q '^GH_TOKEN=' "$out"; then
+    local tok=""
+    command -v gh >/dev/null && tok=$(gh auth token 2>/dev/null || true)
+    if [ -n "$tok" ]; then
+      if [ "${CODESPACES:-}" = true ]; then
+        note "warning: this gh token is a GitHub Codespace's, scoped to one repo."
+        note "         Put a broader one in $CONF_DIR/secrets as GH_TOKEN=..."
+      fi
+      printf 'GH_TOKEN=%s\n' "$tok" >> "$out"
+    else
+      note "note: no GH_TOKEN (gh not logged in) — private repos and git push will not work inside"
+    fi
+  fi
+  # GITHUB_TOKEN too, as Codespaces provides it; tools look for either.
+  if ! grep -q '^GITHUB_TOKEN=' "$out" && grep -q '^GH_TOKEN=' "$out"; then
+    local gt; gt=$(sed -n 's/^GH_TOKEN=/GITHUB_TOKEN=/p' "$out" | tail -1)
+    printf '%s\n' "$gt" >> "$out"
+  fi
+}
+
+stage_config() {
+  local out="$1" v
+  : > "$out"
+  GIT_NAME="${GIT_NAME:-$(git config user.name 2>/dev/null || true)}"
+  GIT_EMAIL="${GIT_EMAIL:-$(git config user.email 2>/dev/null || true)}"
+  for v in GIT_NAME GIT_EMAIL DOTFILES_REPOSITORY DOTFILES_INSTALL_COMMAND \
+           TIMEZONE CODE_SERVER_VERSION DEFAULT_IMAGE; do
+    [ -n "${!v:-}" ] && printf '%s=%q\n' "$v" "${!v}" >> "$out"
+  done
+  return 0
+}
+
+# Uploads config, secrets and signing key into a 0700 inbox on the sprite,
+# plus the agent itself. `codespace` moves them into place on its next run.
+push_files() {
+  local sname="$1" name="$2" stage
+  stage=$(mktemp -d); chmod 700 "$stage"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$stage'" EXIT
+  stage_config "$stage/config"
+  stage_secrets "$name" "$stage/secrets"
+  local -a files=(--file "$AGENT:/tmp/codespace-agent"
+    --file "$stage/config:/home/sprite/.codespace-inbox/config"
+    --file "$stage/secrets:/home/sprite/.codespace-inbox/secrets")
+  if [ -n "${SIGNING_KEY:-}" ]; then
+    [ -r "$SIGNING_KEY" ] || die "SIGNING_KEY=$SIGNING_KEY is not readable"
+    files+=(--file "$SIGNING_KEY:/home/sprite/.codespace-inbox/signing_key")
+  else
+    : > "$stage/no_signing_key"
+    files+=(--file "$stage/no_signing_key:/home/sprite/.codespace-inbox/no_signing_key")
+  fi
+  sp exec -s "$sname" --no-stdin -- install -d -m 700 /home/sprite/.codespace-inbox
+  PUSH_ARGS=("${files[@]}")
+}
+
+# Runs the agent on the sprite after installing the copy just uploaded.
+agent() {
+  local sname="$1"; shift
+  sp exec -s "$sname" --no-stdin "${PUSH_ARGS[@]}" -- bash -c \
+    'sudo install -m 755 /tmp/codespace-agent /usr/local/bin/codespace && rm -f /tmp/codespace-agent && exec codespace "$@"' \
+    _ "$@"
+}
+
+sprite_url() { sprite_json "$1" | jq -r '.url // empty'; }
+
+cmd_create() {
+  local target="" name="" mode="${DEFAULT_MODE:-auto}" url
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name) name="$2"; shift 2 ;;
+      --mode) mode="$2"; shift 2 ;;
+      --native) mode=native; shift ;;
+      --devcontainer) mode=devcontainer; shift ;;
+      -) target=-; shift ;;
+      -*) die "unknown option $1" ;;
+      *) [ -z "$target" ] || die "one repo at a time"; target="$1"; shift ;;
+    esac
+  done
+  [ -n "$target" ] || usage
+  case "$mode" in auto|native|devcontainer) ;; *) die "--mode is auto, native or devcontainer" ;; esac
+
+  if [ "$target" = - ]; then
+    url=-
+  else
+    url=$(normalize_url "$target")
+    [ -n "$name" ] || name=$(basename "${url%.git}")
+  fi
+  local sname; sname=$(sprite_name "$name")
+  name="${sname#"$PREFIX"}"
+  [ -n "$name" ] || die "could not work out a name — pass --name"
+
+  if [ -n "$(sprite_json "$sname")" ]; then
+    note "sprite $sname exists — re-running setup on it"
+  else
+    note "creating sprite $sname"
+    sp create --skip-console --label codespace "$sname" >/dev/null
+  fi
+  require_private_url "$sname"
+
+  push_files "$sname" "$name"
+  agent "$sname" setup "$url" "$name" "$mode"
+
+  note "checkpointing the fresh codespace"
+  sp checkpoint create -s "$sname" --comment "sprite-codespace: fresh $name" >/dev/null \
+    || note "note: checkpoint failed — the codespace itself is fine"
+
+  echo
+  echo "  $sname is ready"
+  echo "  $(sprite_url "$sname")"
+  echo
+  echo "  Sign in with your Fly.io account when asked; only members of the org get in."
+  echo "  Forwarded ports: <url>/proxy/<port>/, or locally with: sprite proxy -s $sname <port>"
+}
+
+cmd_new() {
+  [ $# -ge 1 ] || usage
+  local name="$1"; shift
+  cmd_create - --name "$name" "$@"
+}
+
+cmd_list() {
+  sp --json list --prefix "$PREFIX" \
+    | jq -r '.sprites[]? | [.name, .status, .url] | @tsv' \
+    | { printf 'NAME\tSTATUS\tURL\n'; cat; } | column -t -s "$(printf '\t')"
+}
+
+cmd_open() {
+  [ $# -eq 1 ] || usage
+  local sname url; sname=$(sprite_name "$1")
+  require_sprite "$sname"
+  url=$(sprite_url "$sname")
+  echo "$url"
+  if command -v xdg-open >/dev/null; then xdg-open "$url" >/dev/null 2>&1 &
+  elif command -v open >/dev/null; then open "$url"
+  elif command -v explorer.exe >/dev/null; then explorer.exe "$url"
+  elif [ -n "${BROWSER:-}" ]; then "$BROWSER" "$url"
+  fi
+}
+
+cmd_shell() {
+  [ $# -ge 1 ] || usage
+  local sname; sname=$(sprite_name "$1"); shift
+  require_sprite "$sname"
+  [ "${1:-}" = -- ] && shift
+  if [ $# -gt 0 ]; then
+    exec sprite "${SPRITE_ARGS[@]}" exec -s "$sname" --no-stdin -- codespace shell -- "$*"
+  fi
+  exec sprite "${SPRITE_ARGS[@]}" exec -s "$sname" --tty -- codespace shell
+}
+
+cmd_sync() {
+  [ $# -eq 1 ] || usage
+  local sname; sname=$(sprite_name "$1")
+  require_sprite "$sname"
+  require_private_url "$sname"
+  push_files "$sname" "${sname#"$PREFIX"}"
+  agent "$sname" refresh
+  note "synced $sname"
+}
+
+cmd_passthrough() {
+  local sub="$1"; shift
+  [ $# -eq 1 ] || usage
+  local sname; sname=$(sprite_name "$1")
+  require_sprite "$sname"
+  sp exec -s "$sname" --no-stdin -- codespace "$sub"
+}
+
+cmd_checkpoint() {
+  [ $# -ge 1 ] || usage
+  local sname; sname=$(sprite_name "$1"); shift
+  require_sprite "$sname"
+  sp checkpoint create -s "$sname" --comment "${*:-sprite-codespace: manual}"
+}
+
+cmd_rm() {
+  [ $# -eq 1 ] || usage
+  local sname; sname=$(sprite_name "$1")
+  require_sprite "$sname"
+  echo "This destroys $sname: its files, unpushed commits and every checkpoint." >&2
+  echo "Check first with: sprite-codespace shell ${sname#"$PREFIX"} -- git status" >&2
+  # sprite destroy asks for confirmation itself.
+  sp destroy "$sname"
+}
+
+load_config
+case "${1:-}" in
+  create)     shift; cmd_create "$@" ;;
+  new)        shift; cmd_new "$@" ;;
+  list|ls)    shift; cmd_list ;;
+  open)       shift; cmd_open "$@" ;;
+  shell|ssh)  shift; cmd_shell "$@" ;;
+  sync)       shift; cmd_sync "$@" ;;
+  rebuild)    shift; cmd_passthrough rebuild "$@" ;;
+  logs)       shift; cmd_passthrough logs "$@" ;;
+  status)     shift; cmd_passthrough status "$@" ;;
+  checkpoint) shift; cmd_checkpoint "$@" ;;
+  rm|delete)  shift; cmd_rm "$@" ;;
+  -h|--help|help) usage 0 ;;
+  *) usage ;;
+esac

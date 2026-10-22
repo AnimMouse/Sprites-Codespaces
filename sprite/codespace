@@ -1,0 +1,584 @@
+#!/usr/bin/env bash
+# codespace — the half of Sprites-Codespaces that lives *inside* the sprite.
+#
+# Installed to /usr/local/bin/codespace by `sprite-codespace create` and driven
+# by it over `sprite exec`. One sprite is one codespace, exactly like GitHub
+# Codespaces gives each codespace its own VM; the sprite URL is the editor.
+#
+#   codespace setup <git-url|-> <name> <auto|native|devcontainer>
+#   codespace editor            the sprite service behind the URL (port 8080)
+#   codespace refresh           re-apply secrets, git and dotfiles config
+#   codespace rebuild           recreate the dev container (devcontainer mode)
+#   codespace shell [-- cmd]    a shell in the workspace / the container
+#   codespace logs              editor + setup logs
+#   codespace status            mode, workspace, editor health
+#
+# Two modes:
+#
+#   native        the sprite itself is the machine. code-server runs on it,
+#                 with every runtime the sprite image ships (node, python, go,
+#                 rust, ...). Fast: nothing to build.
+#   devcontainer  .devcontainer/devcontainer.json is honoured with the real
+#                 devcontainer CLI on a dockerd inside the sprite, and
+#                 code-server runs inside that container — same as the
+#                 NixOS-Codespaces-VirtualBox launcher.
+#
+# `auto` (the default) picks devcontainer when the repo has a devcontainer.json
+# and native otherwise. Real Codespaces makes the same choice, with its
+# universal image standing in for the sprite's own.
+
+set -euo pipefail
+
+ROOT=/opt/codespace
+STATE=$ROOT/state
+CONFIG=$ROOT/config
+SECRETS=$ROOT/secrets
+INBOX=$HOME/.codespace-inbox
+GITDIR=$ROOT/git
+CACHE=$ROOT/cache
+LOGDIR=$ROOT/logs
+WORKSPACES=/workspaces
+EDITOR_PORT=8080
+# Inside a dev container code-server listens here, and a socat on the sprite
+# carries $EDITOR_PORT to it. The devcontainer CLI cannot publish ports.
+CONTAINER_EDITOR_PORT=8080
+CONTAINER_CACHE=/var/cache/codespace
+
+die() { echo "codespace: $*" >&2; exit 1; }
+note() { echo "==> $*" >&2; }
+
+state_get() { cat "$STATE/$1" 2>/dev/null || true; }
+state_set() { sudo install -d -o "$(id -u)" -g "$(id -g)" "$STATE"; printf '%s\n' "$2" > "$STATE/$1"; }
+
+load_config() {
+  # Written by sprite-codespace with printf %q, so sourcing it cannot run
+  # anything that was not meant as a value.
+  # shellcheck source=/dev/null
+  [ -r "$CONFIG" ] && . "$CONFIG"
+  return 0
+}
+
+# Codespaces secrets: KEY=value lines. Parsed, never sourced.
+secrets_json() {
+  [ -r "$SECRETS" ] || { echo '{}'; return; }
+  jq -R -s '
+    split("\n")
+    | map(select(test("^[A-Za-z_][A-Za-z0-9_]*=")))
+    | map(capture("^(?<key>[A-Za-z_][A-Za-z0-9_]*)=(?<value>.*)$"))
+    | from_entries' < "$SECRETS"
+}
+
+secrets_exports() { secrets_json | jq -r 'to_entries[] | "export \(.key)=\(.value|@sh)"'; }
+
+# ---------------------------------------------------------------------------
+# Inbox: sprite-codespace uploads config, secrets and the optional signing key
+# into a 0700 directory (uploads land 0644), and this moves them into place.
+
+import_inbox() {
+  sudo install -d -o "$(id -u)" -g "$(id -g)" -m 755 "$ROOT" "$CACHE" "$LOGDIR"
+  install -d -m 700 "$GITDIR"
+  [ -d "$INBOX" ] || return 0
+  if [ -f "$INBOX/config" ]; then install -m 644 "$INBOX/config" "$CONFIG"; fi
+  if [ -f "$INBOX/secrets" ]; then install -m 600 "$INBOX/secrets" "$SECRETS"; fi
+  if [ -f "$INBOX/signing_key" ]; then
+    install -m 600 "$INBOX/signing_key" "$GITDIR/id_signing"
+    ssh-keygen -y -P "" -f "$GITDIR/id_signing" > "$GITDIR/id_signing.pub" 2>/dev/null \
+      || { rm -f "$GITDIR/id_signing" "$GITDIR/id_signing.pub"; note "warning: signing key has a passphrase or is not an SSH key — commit signing skipped"; }
+  elif [ -f "$INBOX/no_signing_key" ]; then
+    rm -f "$GITDIR/id_signing" "$GITDIR/id_signing.pub"
+  fi
+  rm -rf "$INBOX"
+}
+
+# ---------------------------------------------------------------------------
+# Packages
+
+apt_install() {
+  local missing=() p
+  for p in "$@"; do dpkg -s "$p" >/dev/null 2>&1 || missing+=("$p"); done
+  [ ${#missing[@]} -eq 0 ] && return 0
+  note "apt install ${missing[*]}"
+  sudo apt-get update -qq
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${missing[@]}" >/dev/null
+}
+
+code_server_version_arg() {
+  local v="${CODE_SERVER_VERSION:-latest}"
+  v="${v,,}"
+  case "$v" in
+    latest) ;;
+    *[!0-9a-z.-]*) die "CODE_SERVER_VERSION='$v' is not a version — use e.g. 4.141.0, or 'latest'" ;;
+    # The installer does not strip a leading v from an explicit version.
+    *) printf ' --version %s' "${v#v}" ;;
+  esac
+}
+
+install_code_server_native() {
+  command -v code-server >/dev/null && return 0
+  note "installing code-server"
+  # The log is ours, not root's, so the redirect not running under sudo is
+  # what we want.
+  # shellcheck disable=SC2046,SC2024
+  curl -fsSL https://code-server.dev/install.sh \
+    | sudo env XDG_CACHE_HOME="$CACHE" sh -s -- --method standalone --prefix /usr/local $(code_server_version_arg) \
+      >"$LOGDIR/code-server-install.log" 2>&1 \
+    || die "code-server install failed — see $LOGDIR/code-server-install.log"
+}
+
+install_docker() {
+  if ! command -v dockerd >/dev/null; then
+    apt_install docker.io docker-buildx
+  fi
+  if [ ! -f /etc/docker/daemon.json ]; then
+    # The sprite filesystem is an overlay; kernel 6.12+ nests overlay2 on it.
+    sudo install -d /etc/docker
+    echo '{ "storage-driver": "overlay2" }' | sudo tee /etc/docker/daemon.json >/dev/null
+  fi
+  # No systemd on a sprite, so dockerd is a sprite service. --group sprite
+  # rather than the docker group: exec sessions and services do not pick up
+  # supplementary groups added after the sprite booted.
+  if ! sprite-env services get docker >/dev/null 2>&1; then
+    note "registering dockerd as a sprite service"
+    sprite-env services create docker --cmd /usr/bin/sudo \
+      --args "/usr/bin/dockerd,--group,$(id -gn)" --no-stream >/dev/null
+  fi
+  local i
+  for i in $(seq 60); do
+    docker info >/dev/null 2>&1 && return 0
+    [ "$i" = 1 ] && sprite-env services start docker >/dev/null 2>&1 || true
+    sleep 1
+  done
+  die "dockerd did not come up — see /.sprite/logs/services/docker.log"
+}
+
+install_devcontainer_cli() {
+  command -v devcontainer >/dev/null && return 0
+  note "installing the devcontainer CLI"
+  # Its own prefix: a global npm install lands in the active nvm version's
+  # directory, which disappears from PATH the moment you `nvm use` another.
+  npm install -g --silent --prefix "$ROOT/devcontainer-cli" @devcontainers/cli >/dev/null 2>&1 \
+    || die "npm install @devcontainers/cli failed"
+  sudo ln -sf "$ROOT/devcontainer-cli/bin/devcontainer" /usr/local/bin/devcontainer
+}
+
+# ---------------------------------------------------------------------------
+# Git, shell environment, dotfiles — shared by both modes
+
+# A credential helper that needs nothing but $GH_TOKEN in the environment, so
+# it works in any image, with or without gh. The same trick Codespaces uses.
+# shellcheck disable=SC2016
+GIT_CRED_HELPER='!f() { test "$1" = get && test -n "$GH_TOKEN" && echo username=x-access-token && echo "password=$GH_TOKEN"; }; f'
+
+# Prints shell commands that configure git system-wide. Run on the sprite in
+# native mode and inside the container in devcontainer mode; --system so a
+# dotfiles ~/.gitconfig layers over it rather than being clobbered.
+git_system_script() {
+  local keydir="$1"
+  echo 'set -e'
+  echo "git config --system --replace-all credential.https://github.com.helper $(printf %q "$GIT_CRED_HELPER")"
+  [ -n "${GIT_NAME:-}" ]  && echo "git config --system user.name $(printf %q "$GIT_NAME")"
+  [ -n "${GIT_EMAIL:-}" ] && echo "git config --system user.email $(printf %q "$GIT_EMAIL")"
+  if [ -f "$GITDIR/id_signing" ]; then
+    echo 'git config --system gpg.format ssh'
+    echo "git config --system user.signingkey $keydir/id_signing"
+    echo 'git config --system commit.gpgsign true'
+    echo 'git config --system tag.gpgsign true'
+  else
+    echo 'git config --system --unset commit.gpgsign || true'
+    echo 'git config --system --unset tag.gpgsign || true'
+    echo 'git config --system --unset user.signingkey || true'
+  fi
+}
+
+# The profile.d snippet. World-readable, so it holds no values: secrets live
+# in ~/.codespace-secrets (0600) and are only sourced from here.
+profile_snippet() {
+  local name="$1"
+  echo "export CODESPACE_NAME=$name"
+  [ -n "${TIMEZONE:-}" ] && echo "export TZ=$TIMEZONE"
+  # shellcheck disable=SC2016
+  echo '[ -r "$HOME/.codespace-secrets" ] && . "$HOME/.codespace-secrets"'
+  return 0
+}
+
+check_timezone() {
+  [ -n "${TIMEZONE:-}" ] || return 0
+  case "$TIMEZONE" in
+    *[!0-9A-Za-z_+/-]*) die "TIMEZONE='$TIMEZONE' is not a zone name — e.g. Asia/Manila" ;;
+  esac
+}
+
+# GitHub Codespaces' dotfiles rules: clone, then run the first of these that
+# exists, or else symlink every top-level dotfile into $HOME.
+DOTFILES_SCRIPTS="install.sh install bootstrap.sh bootstrap script/bootstrap setup.sh setup script/setup"
+
+apply_dotfiles_native() {
+  [ -n "${DOTFILES_REPOSITORY:-}" ] || return 0
+  local dir="$HOME/dotfiles" url="$DOTFILES_REPOSITORY" s
+  case "$url" in *://*|*@*:*) ;; *) url="https://github.com/$url" ;; esac
+  if [ ! -d "$dir/.git" ]; then
+    note "cloning dotfiles $url"
+    git clone -q "$url" "$dir" || { note "warning: dotfiles clone failed"; return 0; }
+  else
+    git -C "$dir" pull -q --ff-only || note "note: could not update dotfiles; using what is there"
+  fi
+  (
+    cd "$dir"
+    # Secrets in the environment, as Codespaces gives them to install.sh.
+    eval "$(secrets_exports)"
+    for s in ${DOTFILES_INSTALL_COMMAND:-$DOTFILES_SCRIPTS}; do
+      if [ -f "$s" ]; then
+        note "dotfiles: $s"
+        chmod +x "$s"; "./$s"; exit
+      fi
+    done
+    note "dotfiles: no install script — symlinking dotfiles into ~"
+    for s in .[!.]*; do
+      [ "$s" = .git ] && continue
+      ln -sfn "$dir/$s" "$HOME/$s"
+    done
+  ) || note "warning: dotfiles install exited non-zero"
+}
+
+# ---------------------------------------------------------------------------
+# Native mode
+
+native_configure() {
+  local name="$1"
+  check_timezone
+  # The secrets file doubles as gh's login: GH_TOKEN is what gh reads first.
+  install -m 600 /dev/null "$HOME/.codespace-secrets"
+  secrets_exports > "$HOME/.codespace-secrets"
+  git_system_script "$GITDIR" | sudo bash
+  profile_snippet "$name" | sudo tee /etc/profile.d/codespace.sh >/dev/null
+  # `sprite console` and code-server terminals run interactive non-login
+  # shells, which skip profile.d; bash.bashrc covers them.
+  if ! grep -q 'profile.d/codespace.sh' /etc/bash.bashrc 2>/dev/null; then
+    echo '[ -r /etc/profile.d/codespace.sh ] && . /etc/profile.d/codespace.sh' | sudo tee -a /etc/bash.bashrc >/dev/null
+  fi
+  if [ -n "${TIMEZONE:-}" ] && [ -e "/usr/share/zoneinfo/$TIMEZONE" ]; then
+    sudo ln -sf "/usr/share/zoneinfo/$TIMEZONE" /etc/localtime
+  fi
+}
+
+native_editor() {
+  local ws
+  ws=$(state_get workspace)
+  # shellcheck source=/dev/null
+  . /etc/profile.d/codespace.sh
+  cd "$ws"
+  # --auth none is safe only because the sprite URL is itself authenticated
+  # (Fly.io login, org members only). `sprite-codespace` refuses to proceed
+  # if the URL has been made public.
+  exec code-server --bind-addr "0.0.0.0:$EDITOR_PORT" --auth none \
+    --disable-telemetry --disable-update-check "$ws"
+}
+
+# ---------------------------------------------------------------------------
+# Devcontainer mode
+
+container_id() { docker ps -q --filter "label=codespace=$(state_get name)" | head -1; }
+
+# devcontainer up, then everything the CLI does not do: code-server, git,
+# secrets, extensions. Idempotent: the editor service runs it on every boot.
+container_up() {
+  local recreate="${1:-}" name ws up_json cid ruser rws
+  name=$(state_get name)
+  ws=$(state_get workspace)
+  load_config
+  check_timezone
+
+  local -a args=(up --workspace-folder "$ws" --id-label "codespace=$name"
+    --mount "type=bind,source=$CACHE,target=$CONTAINER_CACHE"
+    --mount "type=bind,source=$GITDIR,target=/mnt/codespace-git")
+  [ "$recreate" = recreate ] && args+=(--remove-existing-container)
+
+  if [ ! -f "$ws/.devcontainer/devcontainer.json" ] && [ ! -f "$ws/.devcontainer.json" ]; then
+    local override="$ROOT/devcontainer.json"
+    if [ ! -f "$override" ]; then
+      note "no devcontainer.json in the repo — writing a default to $override"
+      printf '{\n  "name": "%s",\n  "image": "%s"\n}\n' \
+        "$name" "${DEFAULT_IMAGE:-mcr.microsoft.com/devcontainers/base:ubuntu26.04}" > "$override"
+    fi
+    args+=(--override-config "$override")
+  fi
+
+  # Secrets reach postCreateCommand and the dotfiles install through
+  # --secrets-file. GH_TOKEN is among them, and the helper below turns it into
+  # git credentials, so a private dotfiles repo clones over https.
+  local sfile
+  sfile=$(mktemp); chmod 600 "$sfile"
+  secrets_json > "$sfile"
+  args+=(--secrets-file "$sfile"
+    --remote-env "GIT_CONFIG_COUNT=1"
+    --remote-env "GIT_CONFIG_KEY_0=credential.https://github.com.helper"
+    --remote-env "GIT_CONFIG_VALUE_0=$GIT_CRED_HELPER")
+  if [ -n "${DOTFILES_REPOSITORY:-}" ]; then
+    args+=(--dotfiles-repository "$DOTFILES_REPOSITORY")
+    [ -n "${DOTFILES_INSTALL_COMMAND:-}" ] && args+=(--dotfiles-install-command "$DOTFILES_INSTALL_COMMAND")
+  fi
+
+  note "devcontainer up ($name)"
+  up_json=$(devcontainer "${args[@]}") || { rm -f "$sfile"; die "devcontainer up failed"; }
+  rm -f "$sfile"
+  up_json=$(printf '%s\n' "$up_json" | tail -1)
+  cid=$(jq -r '.containerId // empty' <<<"$up_json")
+  ruser=$(jq -r '.remoteUser // "root"' <<<"$up_json")
+  rws=$(jq -r '.remoteWorkspaceFolder // empty' <<<"$up_json")
+  [ -n "$cid" ] && [ -n "$rws" ] || die "devcontainer up reported: $up_json"
+  state_set remote_user "$ruser"
+  state_set remote_workspace "$rws"
+
+  note "ensuring code-server in the container"
+  docker exec -u "$ruser" "$cid" bash -lc \
+    "command -v code-server >/dev/null || curl -fsSL https://code-server.dev/install.sh | sudo env XDG_CACHE_HOME=$CONTAINER_CACHE sh -s -- --method standalone --prefix /usr/local$(code_server_version_arg) >/dev/null 2>&1" \
+    || die "could not install code-server in the container (does the image have curl and sudo?)"
+
+  local home tmp
+  home=$(docker exec -u "$ruser" "$cid" sh -c 'echo $HOME' | tr -d '\r')
+  tmp=$(mktemp); chmod 600 "$tmp"
+  secrets_exports > "$tmp"
+  docker cp "$tmp" "$cid:$home/.codespace-secrets" >/dev/null
+  docker exec -u root "$cid" sh -c "chown $ruser $home/.codespace-secrets && chmod 600 $home/.codespace-secrets"
+  profile_snippet "$name" > "$tmp"
+  docker cp "$tmp" "$cid:/etc/profile.d/codespace.sh" >/dev/null
+  docker exec -u root "$cid" chmod 644 /etc/profile.d/codespace.sh
+  rm -f "$tmp"
+  git_system_script /mnt/codespace-git | docker exec -i -u root "$cid" sh \
+    || note "note: could not write the container's git config (is git in the image?)"
+  if [ -n "${TIMEZONE:-}" ]; then
+    docker exec -u root "$cid" sh -c "[ -e /usr/share/zoneinfo/$TIMEZONE ] && ln -sf /usr/share/zoneinfo/$TIMEZONE /etc/localtime" \
+      || note "note: no zoneinfo for $TIMEZONE in this image"
+  fi
+
+  apply_vscode_customizations "$ws" "$cid" "$ruser" "$home"
+}
+
+# customizations.vscode from devcontainer.json: real Codespaces installs the
+# extensions and applies the settings; code-server does neither on its own.
+# Extensions come from Open VSX, so a Microsoft-only one is skipped with a note.
+apply_vscode_customizations() {
+  local ws="$1" cid="$2" ruser="$3" home="$4" conf marker
+  conf=$(devcontainer read-configuration --workspace-folder "$ws" --container-id "$cid" \
+    --include-merged-configuration 2>/dev/null | tail -1) || return 0
+  marker="$ROOT/customizations.applied"
+  # Only when they changed, so a reboot does not re-download every extension.
+  if [ "$(printf '%s' "$conf" | jq -c '.mergedConfiguration.customizations.vscode // {}' | sha256sum)" = "$(cat "$marker" 2>/dev/null)" ] \
+     && docker exec "$cid" test -e "$home/.local/share/code-server/.codespace-applied"; then
+    return 0
+  fi
+
+  local settings ext
+  settings=$(printf '%s' "$conf" | jq -c '[.mergedConfiguration.customizations.vscode[]?.settings // {}] | add // {}')
+  if [ "$settings" != "{}" ]; then
+    docker exec -i -u "$ruser" "$cid" sh -c \
+      "mkdir -p '$home/.local/share/code-server/Machine' && cat > '$home/.local/share/code-server/Machine/settings.json'" <<<"$settings"
+  fi
+  while IFS= read -r ext; do
+    [ -n "$ext" ] || continue
+    if docker exec -u "$ruser" "$cid" bash -lc "code-server --install-extension $(printf %q "$ext") >/dev/null 2>&1"; then
+      note "extension $ext"
+    else
+      note "note: extension $ext is not on Open VSX — skipped"
+    fi
+  done < <(printf '%s' "$conf" | jq -r '[.mergedConfiguration.customizations.vscode[]?.extensions // [] | .[]] | unique | .[]')
+  docker exec -u "$ruser" "$cid" sh -c "mkdir -p '$home/.local/share/code-server' && touch '$home/.local/share/code-server/.codespace-applied'"
+  printf '%s' "$conf" | jq -c '.mergedConfiguration.customizations.vscode // {}' | sha256sum > "$marker"
+}
+
+container_editor() {
+  install_docker
+  container_up
+  local cid ruser rws ip i
+  cid=$(container_id)
+  ruser=$(state_get remote_user)
+  rws=$(state_get remote_workspace)
+  ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$cid")
+
+  if ! curl -fsS -o /dev/null --max-time 2 "http://$ip:$CONTAINER_EDITOR_PORT/healthz" 2>/dev/null; then
+    docker exec -u root "$cid" sh -c "pkill -f '[c]ode-server.*--bind-addr' >/dev/null 2>&1; exit 0"
+    # From a login shell, so the editor (and every terminal it opens) has the
+    # secrets and git env from /etc/profile.d/codespace.sh.
+    docker exec -d -u "$ruser" -w "$rws" "$cid" bash -lc \
+      "exec code-server --bind-addr 0.0.0.0:$CONTAINER_EDITOR_PORT --auth none \
+         --disable-telemetry --disable-update-check $(printf %q "$rws") >/tmp/code-server.log 2>&1"
+    for i in $(seq 30); do
+      curl -fsS -o /dev/null --max-time 2 "http://$ip:$CONTAINER_EDITOR_PORT/healthz" 2>/dev/null && break
+      [ "$i" = 30 ] && die "code-server did not start in the container — codespace logs"
+      sleep 1
+    done
+  fi
+  note "editor: sprite:$EDITOR_PORT -> $ip:$CONTAINER_EDITOR_PORT"
+  socat "TCP-LISTEN:$EDITOR_PORT,fork,reuseaddr" "TCP:$ip:$CONTAINER_EDITOR_PORT" &
+  local socat_pid=$!
+  # shellcheck disable=SC2064
+  trap "kill $socat_pid 2>/dev/null; exit 0" TERM INT
+  # If the container stops (or comes back on another IP), socat would go on
+  # forwarding into nothing. Exiting instead lets the sprite restart this
+  # service, which brings the container and editor back up.
+  while kill -0 "$socat_pid" 2>/dev/null \
+        && [ "$(docker inspect -f '{{.State.Running}}' "$cid" 2>/dev/null)" = true ]; do
+    sleep 5
+  done
+  kill "$socat_pid" 2>/dev/null || true
+  die "the container stopped — restarting the editor"
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+
+register_editor_service() {
+  local mode="$1" needs=()
+  [ "$mode" = devcontainer ] && needs=(--needs docker)
+  sprite-env services delete editor >/dev/null 2>&1 || true
+  # --http-port makes this the service behind the sprite URL, and makes the
+  # proxy start it on the first request after the sprite wakes.
+  sprite-env services create editor --cmd /usr/local/bin/codespace --args editor \
+    --http-port "$EDITOR_PORT" "${needs[@]}" --no-stream >/dev/null
+}
+
+wait_for_editor() {
+  local i
+  note "waiting for the editor"
+  for i in $(seq 180); do
+    curl -fsS -o /dev/null --max-time 2 "http://127.0.0.1:$EDITOR_PORT/healthz" 2>/dev/null && return 0
+    sleep 1
+  done
+  tail -n 30 /.sprite/logs/services/editor.log >&2 || true
+  die "the editor did not answer on :$EDITOR_PORT"
+}
+
+cmd_setup() {
+  [ $# -eq 3 ] || die "usage: codespace setup <git-url|-> <name> <auto|native|devcontainer>"
+  local url="$1" name="$2" mode="$3" ws
+  import_inbox
+  load_config
+  apt_install git jq socat curl ca-certificates
+
+  ws="$WORKSPACES/$name"
+  sudo install -d -o "$(id -u)" -g "$(id -g)" "$WORKSPACES"
+  state_set name "$name"
+  state_set workspace "$ws"
+
+  # Git config first, so the clone itself can use the token for private repos.
+  native_configure "$name"
+  if [ "$url" = - ]; then
+    mkdir -p "$ws"
+  elif [ ! -d "$ws/.git" ]; then
+    note "cloning $url -> $ws"
+    # shellcheck source=/dev/null
+    (. "$HOME/.codespace-secrets"; git clone "$url" "$ws") || die "clone failed"
+  fi
+
+  if [ "$mode" = auto ]; then
+    if [ -f "$ws/.devcontainer/devcontainer.json" ] || [ -f "$ws/.devcontainer.json" ]; then
+      mode=devcontainer
+    else
+      mode=native
+    fi
+  fi
+  state_set mode "$mode"
+  note "mode: $mode"
+
+  case "$mode" in
+    native)
+      install_code_server_native
+      apply_dotfiles_native
+      ;;
+    devcontainer)
+      install_docker
+      install_devcontainer_cli
+      # Up front and in the foreground, so the image build is visible here
+      # instead of buried in the service log.
+      container_up
+      ;;
+    *) die "mode must be auto, native or devcontainer" ;;
+  esac
+
+  register_editor_service "$mode"
+  wait_for_editor
+  note "ready"
+}
+
+cmd_refresh() {
+  import_inbox
+  load_config
+  local name mode
+  name=$(state_get name); mode=$(state_get mode)
+  [ -n "$name" ] || die "not set up yet"
+  native_configure "$name"
+  if [ "$mode" = native ]; then
+    apply_dotfiles_native
+  fi
+  # Restarting the editor re-runs container_up in devcontainer mode, which
+  # rewrites the container's secrets and git config, and gives native-mode
+  # terminals the new environment.
+  sprite-env services restart editor >/dev/null
+  wait_for_editor
+}
+
+cmd_rebuild() {
+  [ "$(state_get mode)" = devcontainer ] \
+    || die "native mode has no container to rebuild — use a sprite checkpoint to roll back instead"
+  sprite-env services stop editor >/dev/null 2>&1 || true
+  container_up recreate
+  sprite-env services start editor >/dev/null
+  wait_for_editor
+}
+
+cmd_shell() {
+  local ws mode
+  ws=$(state_get workspace); mode=$(state_get mode)
+  [ "${1:-}" = -- ] && shift
+  if [ "$mode" = devcontainer ]; then
+    local cid; cid=$(container_id)
+    [ -n "$cid" ] || die "the container is not running — open the URL, or: codespace rebuild"
+    local -a dexec=(docker exec -i)
+    [ -t 0 ] && dexec+=(-t)
+    dexec+=(-u "$(state_get remote_user)" -w "$(state_get remote_workspace)" "$cid")
+    if [ $# -gt 0 ]; then exec "${dexec[@]}" bash -lc "$*"; fi
+    exec "${dexec[@]}" bash -l
+  fi
+  cd "$ws"
+  if [ $# -gt 0 ]; then exec bash -lc "$*"; fi
+  exec bash -l
+}
+
+cmd_logs() {
+  echo "--- editor service (/.sprite/logs/services/editor.log)"
+  tail -n 40 /.sprite/logs/services/editor.log 2>/dev/null || true
+  if [ "$(state_get mode)" = devcontainer ]; then
+    local cid; cid=$(container_id)
+    if [ -n "$cid" ]; then
+      echo "--- code-server in the container (/tmp/code-server.log)"
+      docker exec "$cid" tail -n 40 /tmp/code-server.log 2>/dev/null || true
+    fi
+  fi
+}
+
+cmd_status() {
+  local health=down
+  curl -fsS -o /dev/null --max-time 2 "http://127.0.0.1:$EDITOR_PORT/healthz" 2>/dev/null && health=up
+  printf 'name:      %s\nmode:      %s\nworkspace: %s\neditor:    %s\n' \
+    "$(state_get name)" "$(state_get mode)" "$(state_get workspace)" "$health"
+}
+
+cmd_editor() {
+  load_config
+  case "$(state_get mode)" in
+    native) native_editor ;;
+    devcontainer) container_editor ;;
+    *) die "not set up yet — run: sprite-codespace create" ;;
+  esac
+}
+
+case "${1:-}" in
+  setup)   shift; cmd_setup "$@" ;;
+  editor)  cmd_editor ;;
+  refresh) cmd_refresh ;;
+  rebuild) cmd_rebuild ;;
+  shell)   shift; cmd_shell "$@" ;;
+  logs)    cmd_logs ;;
+  status)  cmd_status ;;
+  *) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1 ;;
+esac
