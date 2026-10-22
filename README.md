@@ -30,7 +30,8 @@ the same model, but nothing runs on your PC.
 ## Setup
 
 You need the [`sprite` CLI](https://sprites.dev), logged in (`sprite login`),
-plus `bash`, `jq` and, optionally, `gh`. On Windows, use WSL or Git Bash.
+plus `bash`, `jq` and, optionally, `gh`. On Windows, use Git Bash (install
+`jq` separately), or run it from the NixOS VM or a GitHub Codespace.
 
 ```bash
 git clone https://github.com/AnimMouse/Sprites-Codespaces ~/Sprites-Codespaces
