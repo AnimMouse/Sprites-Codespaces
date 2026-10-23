@@ -30,3 +30,7 @@
 
 # Image for --devcontainer on a repo with no devcontainer.json.
 #DEFAULT_IMAGE=mcr.microsoft.com/devcontainers/base:ubuntu26.04
+
+# Extra swap at /var/lib/docker/swapfile, re-enabled whenever the editor starts.
+# Change it and `sprite-codespace sync` to resize; 0 removes the file.
+#SWAP_SIZE=2G

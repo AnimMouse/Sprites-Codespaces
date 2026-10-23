@@ -30,6 +30,7 @@ where things stand and what has not been proven yet.
 | Sleep and wake | Went `warm` after about 1 min idle, then `cold`, and the editor answered within 1 s of waking |
 | Container stopped under the editor | Healed itself in 6 s through the watchdog. Stopping the service leaves no stray `socat` |
 | `list`, `status`, the checkpoint taken on `create` | Work |
+| `SWAP_SIZE` | On a throwaway sprite: created at 2G, re-enabled by an editor restart after `swapoff`, resized to 1G, an invalid value only warned, and `0` removed the file |
 | shellcheck | Clean on both scripts |
 
 ---

@@ -124,6 +124,7 @@ On the sprite:
 /opt/codespace/git/               signing key, 0700; mounted at /mnt/codespace-git in containers
 /opt/codespace/cache/             code-server tarball cache; mounted at /var/cache/codespace
 /opt/codespace/devcontainer-cli/  devcontainer CLI, own npm prefix
+/var/lib/docker/swapfile          extra swap when SWAP_SIZE is set (ext4, see §7)
 /workspaces/<name>                the checkout
 ~/.codespace-secrets              export lines, 0600, sourced by /etc/profile.d/codespace.sh
 ~/.codespace-inbox/               0700 upload drop; emptied by import_inbox
@@ -169,6 +170,7 @@ Locally, the config is `~/.config/sprite-codespace/{config,secrets,<name>.secret
 | **Reading the Sprites API token is blocked** for Claude by the auto-mode classifier, so the URL proxy cannot be curl-tested from here | Test the editor inside the sprite (`curl localhost:8080/healthz`) and ask the user to open the URL |
 | **`sprite exec` prints `bind: warning: line editing not enabled`** from the sprite's `.bashrc` | Harmless. Filter it when reading output |
 | **The code-server installer draws a progress bar on stderr** | Send install output to `/opt/codespace/logs/code-server-install.log` |
+| **The sprite root is overlayfs, and swapon refuses files on it.** `/var/lib/docker` is a separate ext4 mount (`/dev/nbd1`) in both modes, even when docker is not installed. Nothing re-runs swapon at boot | `SWAP_SIZE` puts the file at `/var/lib/docker/swapfile`, and `ensure_swap` runs on `setup`, `refresh` and every editor start. A changed size recreates the file, `0` removes it, and failures only warn |
 | **Open VSX, not the Marketplace** (same as the sibling repo) | Install `customizations.vscode.extensions` one by one and skip failures with a note. The sha256 marker of the customizations avoids reinstalling on every boot |
 
 Carried over from the sibling repo, and still true here: `--remote-env` and
