@@ -1,4 +1,6 @@
-# sprite-codespace config — copy to ~/.config/sprite-codespace/config
+# sprite-codespace config — copy to ~/.config/sprite-codespace/config, and/or
+# to .sprite-codespace/config in the directory you run sprite-codespace from
+# (gitignored in this repo). The local file is read second, so it wins.
 # Plain shell assignments; every line is optional.
 
 # Sprites org, if you belong to more than one (default: the CLI's selected org).
@@ -14,9 +16,16 @@
 #GIT_NAME="Anim Mouse"
 #GIT_EMAIL=you@example.com
 
-# Commit signing: a passphrase-less SSH private key, copied to each codespace.
-# Add its .pub on GitHub as a *Signing key*. Leave unset to not sign.
-#SIGNING_KEY=$HOME/.ssh/id_ed25519
+# An SSH key for the sprite's ssh-agent; a passphrase is fine. Only the .pub
+# (which must sit next to it) is stored on the sprite. `sprite-codespace
+# ssh-auth <name>` unlocks it, once per sprite reboot. Commits are signed
+# with it through the agent, unless SIGNING_KEY is set.
+#SSH_KEY=$HOME/.ssh/id_ed25519
+
+# Commit signing with a passphrase-less SSH private key, copied to each
+# codespace. Takes precedence over SSH_KEY for signing. Add its .pub on GitHub
+# as a *Signing key*. Leave both unset to not sign.
+#SIGNING_KEY=$HOME/.ssh/id_ed25519_signing
 
 # Dotfiles, exactly as in Codespaces settings. Private repos work: the clone
 # uses GH_TOKEN.

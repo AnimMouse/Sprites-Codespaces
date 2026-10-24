@@ -31,6 +31,10 @@ where things stand and what has not been proven yet.
 | Container stopped under the editor | Healed itself in 6 s through the watchdog. Stopping the service leaves no stray `socat` |
 | `list`, `status`, the checkpoint taken on `create` | Work |
 | `SWAP_SIZE` | On a throwaway sprite: created at 2G, re-enabled by an editor restart after `swapoff`, resized to 1G, an invalid value only warned, and `0` removed the file |
+| `./.sprite-codespace/` config layer | `SSH_KEY` and `SWAP_SIZE` read from it alone, with the global config dir empty |
+| `SSH_KEY` + `ssh-auth`, native | Passphrase prompt through `--tty`, then `Identity added`, `status` shows `unlocked`, a second run says already unlocked, `/dev/shm` left empty. In the shell: `SSH_AUTH_SOCK` set, `ssh-add -l` lists the key, `git commit` is SSH-signed, and `ssh -o BatchMode=yes -T git@github.com` gets past host-key checking (the test key is not on GitHub, so it then gets `Permission denied`, as expected) |
+| `SSH_KEY` + `ssh-auth`, devcontainer (`vscode-remote-try-node`) | Same results inside the container. The container user `node` is uid 1001, which settles the `updateRemoteUserUID` assumption below |
+| Abandoned `ssh-auth` (client killed at the prompt) | The session and the key directory were both gone 140 s later, through the 2-minute timeout |
 | shellcheck | Clean on both scripts |
 
 ---
@@ -48,10 +52,20 @@ Built from documentation or reasoning only. Treat these as unproven:
 - **A private repo clone and `git push` with a real token.** Every test used
   the Codespace's repo-scoped `gh` token against public repos. The credential
   helper was only checked for being configured.
-- **Commit signing (`SIGNING_KEY`).** Untested end to end. In devcontainer
-  mode it depends on the devcontainer CLI's `updateRemoteUserUID` giving the
-  container user uid 1001, so that it can read the 0700
-  `/opt/codespace/git` mount. That is assumed, not observed.
+- **Commit signing with `SIGNING_KEY`.** Signing through `SSH_KEY` is
+  verified in both modes, and the uid 1001 mapping the container needs has
+  been observed. The `SIGNING_KEY` path itself (a passphrase-less key copied
+  to the sprite) has not been run.
+- **`ssh-auth` in a real terminal.** It was only driven through `script` with
+  piped input. Untested there: Ctrl-C at the prompt (it should reach the
+  remote `ssh-add` as a raw `^C`, and the local trap also cleans up), and
+  `sprite exec --tty` from Git Bash on Windows (mintty is not a native
+  console, which some CLIs need `winpty` for).
+- **The agent across a real sprite reboot.** It is expected to come back
+  empty, with `status` saying `locked`. Not observed, because no real reboot
+  has been seen yet.
+- **A real key pushing over SSH**, as opposed to getting past host-key
+  checking.
 - **`TIMEZONE`, `CODE_SERVER_VERSION`, `DEFAULT_IMAGE`, `DEFAULT_MODE`, `SPRITE_ORG`**,
   and per-codespace `<name>.secrets` overrides.
 - **A real sprite reboot.** `cold` turned out to be a suspend, so the

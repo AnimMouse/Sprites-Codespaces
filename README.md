@@ -41,6 +41,17 @@ mkdir -p ~/.config/sprite-codespace
 cp ~/Sprites-Codespaces/config.example ~/.config/sprite-codespace/config   # then edit
 ```
 
+Configuration can also go in a `.sprite-codespace/` directory in whatever
+directory you run `sprite-codespace` from. It holds the same `config`,
+`secrets` and `<name>.secrets` files, which are read after the ones in
+`~/.config/sprite-codespace/`, so they win. This repo's `.gitignore` already
+covers the directory, so in a clone of it you can keep everything there:
+
+```bash
+cd ~/Sprites-Codespaces
+mkdir -p .sprite-codespace && cp config.example .sprite-codespace/config
+```
+
 ### Secrets
 
 These are `KEY=value` lines, the equivalent of Codespaces user secrets:
@@ -53,8 +64,7 @@ SSH_ANIMMOZ_KEY=...
 EOF
 ```
 
-`~/.config/sprite-codespace/<name>.secrets` overrides the global file for one
-codespace. Secrets reach `postCreateCommand`, the dotfiles install script, and
+`<name>.secrets` overrides `secrets` for one codespace. Secrets reach `postCreateCommand`, the dotfiles install script, and
 every terminal. After editing, run `sprite-codespace sync <name>` to push the
 change.
 
@@ -63,6 +73,38 @@ credential helper turns it into HTTPS credentials, the way Codespaces uses
 `GITHUB_TOKEN`. If you don't set it, it defaults to `gh auth token` from your
 machine. Inside a GitHub Codespace that token only covers one repo, so in that
 case put a real token in the secrets file.
+
+### SSH key: `ssh-auth`
+
+This works like `ssh-auth` in NixOS-Codespaces-VirtualBox. Set `SSH_KEY` to a
+private key; a passphrase is fine. Its `.pub` must sit next to it.
+
+```bash
+SSH_KEY=$HOME/.ssh/id_ed25519
+```
+
+Then, once per sprite boot:
+
+```bash
+sprite-codespace ssh-auth repo    # asks for the passphrase; a no-op if already unlocked
+```
+
+Each codespace runs its own `ssh-agent` as a sprite service. Your PC's agent
+can't be forwarded through `sprite exec`. `ssh-auth` uploads the key into
+tmpfs, `ssh-add` asks for the passphrase in your terminal, and the key file is
+deleted. The decrypted key then lives only in that agent's memory. It survives
+the sprite sleeping, but not a reboot. `SSH_AUTH_SOCK` points at the agent in
+every terminal, on the sprite or inside the dev container. `create` runs
+`ssh-auth` for you when it is run from a terminal.
+
+The key also signs commits, through the agent, as one key does everything in
+the VirtualBox setup. Add its `.pub` on GitHub as both an authentication key
+and a signing key. GitHub's SSH host keys are installed from GitHub's API, so
+`ssh -T git@github.com` doesn't ask you to trust anything. HTTPS remotes keep
+using `GH_TOKEN`.
+
+If the prompt is abandoned, for example because the terminal was closed, it
+gives up after 2 minutes and the uploaded key file is removed.
 
 ## Daily use
 
@@ -76,6 +118,8 @@ sprite-codespace shell repo -- npm test   # one-shot
 sprite-codespace sync repo                # after changing secrets, config or your gh login
 sprite-codespace rebuild repo             # after changing devcontainer.json
 sprite-codespace checkpoint repo "before upgrade"
+sprite-codespace ssh-auth repo            # unlock SSH_KEY into the sprite's agent
+sprite-codespace status repo              # mode, editor health, SSH key locked or not
 sprite-codespace logs repo                # when the URL doesn't load
 sprite-codespace rm repo                  # destroy it (asks first)
 ```
@@ -120,7 +164,8 @@ sprite-codespace ──sprite exec──▶  /usr/local/bin/codespace  (sprite/c
                                          native:       code-server on the workspace
                                          devcontainer: devcontainer up → code-server in
                                                        the container → socat :8080
-                                       docker  (devcontainer mode only)
+                                       docker     (devcontainer mode only)
+                                       ssh-agent  (when SSH_KEY is set)
 ```
 
 - **The URL is the login.** The sprite URL uses `sprite` auth, which means a
@@ -149,5 +194,7 @@ sprite-codespace ──sprite exec──▶  /usr/local/bin/codespace  (sprite/c
 - One editor per sprite, because a sprite has one URL. One codespace per
   sprite is also how Codespaces works.
 - Extensions come from Open VSX, not the Microsoft Marketplace.
-- Commit signing needs a passphrase-less key (`SIGNING_KEY`), because there is
-  no agent forwarding into a sprite. Use a dedicated key for this.
+- There's no forwarding of your PC's ssh-agent. `SSH_KEY` gives each sprite
+  an agent of its own, which needs `ssh-auth` again after every sprite reboot.
+  Anyone who can open the sprite URL gets a terminal, and so can use the
+  unlocked key. They can't copy it out of the agent.

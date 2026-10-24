@@ -12,6 +12,8 @@
 #   codespace shell [-- cmd]    a shell in the workspace / the container
 #   codespace logs              editor + setup logs
 #   codespace status            mode, workspace, editor health
+#   codespace ssh-auth [<dir>]  load the uploaded SSH key into the sprite's agent
+#   codespace ssh-agent         the sprite service holding that agent
 #
 # Two modes:
 #
@@ -43,6 +45,14 @@ EDITOR_PORT=8080
 # carries $EDITOR_PORT to it. The devcontainer CLI cannot publish ports.
 CONTAINER_EDITOR_PORT=8080
 CONTAINER_CACHE=/var/cache/codespace
+# The ssh-agent's socket lives in a directory of its own, and the *directory*
+# is what dev containers mount: an agent restarted after a reboot makes a new
+# socket, which a file bind mount would not follow. Under /mnt in containers,
+# like the sibling repo's agent socket, because docker-in-docker mounts a
+# tmpfs over /tmp.
+SSH_AGENT_DIR=$ROOT/ssh-agent
+SSH_AGENT_SOCK=$SSH_AGENT_DIR/agent.sock
+CONTAINER_SSH_DIR=/mnt/codespace-ssh
 
 die() { echo "codespace: $*" >&2; exit 1; }
 note() { echo "==> $*" >&2; }
@@ -86,6 +96,13 @@ import_inbox() {
       || { rm -f "$GITDIR/id_signing" "$GITDIR/id_signing.pub"; note "warning: signing key has a passphrase or is not an SSH key — commit signing skipped"; }
   elif [ -f "$INBOX/no_signing_key" ]; then
     rm -f "$GITDIR/id_signing" "$GITDIR/id_signing.pub"
+  fi
+  # Only the public half of SSH_KEY is ever kept. The private key reaches the
+  # sprite solely through `ssh-auth`, into tmpfs, for as long as ssh-add takes.
+  if [ -f "$INBOX/ssh_key.pub" ]; then
+    install -m 644 "$INBOX/ssh_key.pub" "$GITDIR/ssh_key.pub"
+  elif [ -f "$INBOX/no_ssh_key" ]; then
+    rm -f "$GITDIR/ssh_key.pub"
   fi
   rm -rf "$INBOX"
 }
@@ -203,6 +220,59 @@ ensure_swap() {
 }
 
 # ---------------------------------------------------------------------------
+# SSH agent — the sibling repo's `ssh-auth`, moved onto the sprite
+#
+# Your PC's agent cannot be forwarded through `sprite exec`, so the agent runs
+# here instead, as a sprite service. `sprite-codespace ssh-auth` uploads the
+# (passphrase-protected) key into tmpfs, ssh-add prompts for the passphrase on
+# your terminal, and the key file is deleted. From then on the decrypted key
+# exists only in this agent's memory: it survives the sprite sleeping, and is
+# gone after a real reboot, when `ssh-auth` has to be run again.
+
+ssh_agent_wanted() { [ -f "$GITDIR/ssh_key.pub" ]; }
+
+ensure_ssh_agent() {
+  if ! ssh_agent_wanted; then
+    sprite-env services delete ssh-agent >/dev/null 2>&1 || true
+    return 0
+  fi
+  install -d -m 700 "$SSH_AGENT_DIR"
+  # An ssh-auth whose session died (closed terminal, lost network) leaves its
+  # upload behind, its trap never having run. Encrypted and in tmpfs, but
+  # still not something to keep: no prompt waits anywhere near 5 minutes.
+  find /dev/shm -maxdepth 1 -name 'codespace-ssh.*' -user "$(id -u)" -mmin +5 \
+    -exec rm -rf {} + 2>/dev/null || true
+  if ! sprite-env services get ssh-agent >/dev/null 2>&1; then
+    sprite-env services create ssh-agent --cmd /usr/local/bin/codespace \
+      --args ssh-agent --no-stream >/dev/null
+  fi
+  # ssh-add -l: 0 = has keys, 1 = empty, 2 = no agent at that socket.
+  local i rc
+  for i in $(seq 20); do
+    rc=0; SSH_AUTH_SOCK="$SSH_AGENT_SOCK" ssh-add -l >/dev/null 2>&1 || rc=$?
+    [ "$rc" != 2 ] && return 0
+    [ "$i" = 1 ] && { sprite-env services start ssh-agent >/dev/null 2>&1 || true; }
+    sleep 0.5
+  done
+  die "ssh-agent did not come up — see /.sprite/logs/services/ssh-agent.log"
+}
+
+# GitHub's host keys, from GitHub's own API over https rather than trusted on
+# first use. Written to ssh_known_hosts2, which ssh reads by default and
+# nothing else on the sprite or in common images claims.
+ensure_github_known_hosts() {
+  ssh_agent_wanted || return 0
+  [ -s "$GITDIR/known_hosts" ] && return 0
+  local tmp; tmp=$(mktemp)
+  if curl -fsSL https://api.github.com/meta | jq -r '.ssh_keys[] | "github.com " + .' > "$tmp" && [ -s "$tmp" ]; then
+    install -m 644 "$tmp" "$GITDIR/known_hosts"
+  else
+    note "note: could not fetch GitHub's SSH host keys — ssh will ask to trust github.com"
+  fi
+  rm -f "$tmp"
+}
+
+# ---------------------------------------------------------------------------
 # Git, shell environment, dotfiles — shared by both modes
 
 # A credential helper that needs nothing but $GH_TOKEN in the environment, so
@@ -219,9 +289,16 @@ git_system_script() {
   echo "git config --system --replace-all credential.https://github.com.helper $(printf %q "$GIT_CRED_HELPER")"
   [ -n "${GIT_NAME:-}" ]  && echo "git config --system user.name $(printf %q "$GIT_NAME")"
   [ -n "${GIT_EMAIL:-}" ] && echo "git config --system user.email $(printf %q "$GIT_EMAIL")"
-  if [ -f "$GITDIR/id_signing" ]; then
+  # SIGNING_KEY wins. Otherwise SSH_KEY signs too, through the agent: given a
+  # *public* key, `ssh-keygen -Y sign` asks the agent for the private half,
+  # so one key authenticates and signs, as in the sibling repo.
+  local signkey=""
+  if [ -f "$GITDIR/id_signing" ]; then signkey="$keydir/id_signing"
+  elif ssh_agent_wanted; then signkey="$keydir/ssh_key.pub"
+  fi
+  if [ -n "$signkey" ]; then
     echo 'git config --system gpg.format ssh'
-    echo "git config --system user.signingkey $keydir/id_signing"
+    echo "git config --system user.signingkey $signkey"
     echo 'git config --system commit.gpgsign true'
     echo 'git config --system tag.gpgsign true'
   else
@@ -234,9 +311,10 @@ git_system_script() {
 # The profile.d snippet. World-readable, so it holds no values: secrets live
 # in ~/.codespace-secrets (0600) and are only sourced from here.
 profile_snippet() {
-  local name="$1"
+  local name="$1" sock="$2"
   echo "export CODESPACE_NAME=$name"
   [ -n "${TIMEZONE:-}" ] && echo "export TZ=$TIMEZONE"
+  ssh_agent_wanted && echo "export SSH_AUTH_SOCK=$sock"
   # shellcheck disable=SC2016
   echo '[ -r "$HOME/.codespace-secrets" ] && . "$HOME/.codespace-secrets"'
   return 0
@@ -291,7 +369,10 @@ native_configure() {
   install -m 600 /dev/null "$HOME/.codespace-secrets"
   secrets_exports > "$HOME/.codespace-secrets"
   git_system_script "$GITDIR" | sudo bash
-  profile_snippet "$name" | sudo tee /etc/profile.d/codespace.sh >/dev/null
+  profile_snippet "$name" "$SSH_AGENT_SOCK" | sudo tee /etc/profile.d/codespace.sh >/dev/null
+  if ssh_agent_wanted && [ -s "$GITDIR/known_hosts" ]; then
+    sudo install -m 644 "$GITDIR/known_hosts" /etc/ssh/ssh_known_hosts2
+  fi
   # `sprite console` and code-server terminals run interactive non-login
   # shells, which skip profile.d; bash.bashrc covers them.
   if ! grep -q 'profile.d/codespace.sh' /etc/bash.bashrc 2>/dev/null; then
@@ -329,9 +410,14 @@ container_up() {
   load_config
   check_timezone
 
+  # The agent directory is mounted whether or not SSH_KEY is set, so turning
+  # it on later needs only a sync, not a rebuild. Created first: docker would
+  # otherwise create a missing bind source itself, owned by root.
+  install -d -m 700 "$SSH_AGENT_DIR"
   local -a args=(up --workspace-folder "$ws" --id-label "codespace=$name"
     --mount "type=bind,source=$CACHE,target=$CONTAINER_CACHE"
-    --mount "type=bind,source=$GITDIR,target=/mnt/codespace-git")
+    --mount "type=bind,source=$GITDIR,target=/mnt/codespace-git"
+    --mount "type=bind,source=$SSH_AGENT_DIR,target=$CONTAINER_SSH_DIR")
   [ "$recreate" = recreate ] && args+=(--remove-existing-container)
 
   if [ ! -f "$ws/.devcontainer/devcontainer.json" ] && [ ! -f "$ws/.devcontainer.json" ]; then
@@ -381,10 +467,23 @@ container_up() {
   secrets_exports > "$tmp"
   docker cp "$tmp" "$cid:$home/.codespace-secrets" >/dev/null
   docker exec -u root "$cid" sh -c "chown $ruser $home/.codespace-secrets && chmod 600 $home/.codespace-secrets"
-  profile_snippet "$name" > "$tmp"
+  profile_snippet "$name" "$CONTAINER_SSH_DIR/agent.sock" > "$tmp"
   docker cp "$tmp" "$cid:/etc/profile.d/codespace.sh" >/dev/null
   docker exec -u root "$cid" chmod 644 /etc/profile.d/codespace.sh
   rm -f "$tmp"
+  if ssh_agent_wanted; then
+    # `up` reuses an existing container and ignores new --mount flags, so a
+    # container from before this mount existed has to be told to rebuild.
+    case " $(docker inspect -f '{{range .Mounts}}{{.Destination}} {{end}}' "$cid") " in
+      *" $CONTAINER_SSH_DIR "*) ;;
+      *) note "note: this container predates the ssh-agent mount — run: sprite-codespace rebuild $name" ;;
+    esac
+    if [ -s "$GITDIR/known_hosts" ]; then
+      docker exec -u root "$cid" mkdir -p /etc/ssh
+      docker cp "$GITDIR/known_hosts" "$cid:/etc/ssh/ssh_known_hosts2" >/dev/null
+      docker exec -u root "$cid" chmod 644 /etc/ssh/ssh_known_hosts2
+    fi
+  fi
   git_system_script /mnt/codespace-git | docker exec -i -u root "$cid" sh \
     || note "note: could not write the container's git config (is git in the image?)"
   if [ -n "${TIMEZONE:-}" ]; then
@@ -496,6 +595,8 @@ cmd_setup() {
   load_config
   apt_install git jq socat curl ca-certificates
   ensure_swap
+  ensure_github_known_hosts
+  ensure_ssh_agent
 
   ws="$WORKSPACES/$name"
   sudo install -d -o "$(id -u)" -g "$(id -g)" "$WORKSPACES"
@@ -546,6 +647,8 @@ cmd_refresh() {
   import_inbox
   load_config
   ensure_swap
+  ensure_github_known_hosts
+  ensure_ssh_agent
   local name mode
   name=$(state_get name); mode=$(state_get mode)
   [ -n "$name" ] || die "not set up yet"
@@ -600,10 +703,65 @@ cmd_logs() {
 }
 
 cmd_status() {
-  local health=down
+  local health=down agent=off
   curl -fsS -o /dev/null --max-time 2 "http://127.0.0.1:$EDITOR_PORT/healthz" 2>/dev/null && health=up
-  printf 'name:      %s\nmode:      %s\nworkspace: %s\neditor:    %s\n' \
-    "$(state_get name)" "$(state_get mode)" "$(state_get workspace)" "$health"
+  if ssh_agent_wanted; then
+    if SSH_AUTH_SOCK="$SSH_AGENT_SOCK" ssh-add -T "$GITDIR/ssh_key.pub" >/dev/null 2>&1; then
+      agent=unlocked
+    else
+      agent="locked — run: sprite-codespace ssh-auth $(state_get name)"
+    fi
+  fi
+  printf 'name:      %s\nmode:      %s\nworkspace: %s\neditor:    %s\nssh key:   %s\n' \
+    "$(state_get name)" "$(state_get mode)" "$(state_get workspace)" "$health" "$agent"
+}
+
+# <dir> is the 0700 tmpfs directory sprite-codespace uploaded key and key.pub
+# into. Removed on the way out whatever happens; the local side removes it
+# too, in case this is killed before the trap can run.
+cmd_ssh_auth() {
+  local dir="${1:-}"
+  if [ -n "$dir" ]; then
+    case "$dir" in /dev/shm/codespace-ssh.*) ;; *) die "refusing to use $dir" ;; esac
+    # shellcheck disable=SC2064
+    trap "rm -rf '$dir'" EXIT
+  fi
+  ssh_agent_wanted || die "no SSH_KEY on this codespace — set it in your config, then: sprite-codespace sync"
+  # Compared on type and key only: the comment field may differ.
+  if [ -f "$dir/key.pub" ] \
+     && [ "$(awk '{print $1, $2}' "$dir/key.pub")" != "$(awk '{print $1, $2}' "$GITDIR/ssh_key.pub")" ]; then
+    die "SSH_KEY has changed since the last sync — run: sprite-codespace sync $(state_get name)"
+  fi
+  ensure_ssh_agent
+  export SSH_AUTH_SOCK="$SSH_AGENT_SOCK"
+  # -T proves the agent can sign with the private half of this public key,
+  # which is the property worth knowing; -l would only list something.
+  if ssh-add -T "$GITDIR/ssh_key.pub" >/dev/null 2>&1; then
+    note "the key is already unlocked"
+    return 0
+  fi
+  [ -f "$dir/key" ] || die "the key is locked and none was uploaded — run: sprite-codespace ssh-auth $(state_get name)"
+  chmod 600 "$dir/key"
+  # Prompts on the terminal sprite-codespace allocated. Never an askpass: a
+  # sprite has no display, and ssh-add would wait on nothing.
+  #
+  # Bounded, because a sprite keeps a TTY exec session alive after its client
+  # goes away: close the terminal at this prompt and ssh-add would otherwise
+  # wait forever, holding the key file and keeping the sprite awake. On
+  # timeout the EXIT trap still removes the directory. --foreground, or
+  # ssh-add is put in a background process group and stopped by SIGTTIN the
+  # moment it reads the terminal.
+  local rc=0
+  SSH_ASKPASS_REQUIRE=never timeout --foreground 120 ssh-add "$dir/key" || rc=$?
+  [ "$rc" = 124 ] && die "no passphrase within 2 minutes — run ssh-auth again"
+  return "$rc"
+}
+
+cmd_ssh_agent_service() {
+  install -d -m 700 "$SSH_AGENT_DIR"
+  # A socket left by the agent before a reboot makes ssh-agent refuse to bind.
+  rm -f "$SSH_AGENT_SOCK"
+  exec ssh-agent -D -a "$SSH_AGENT_SOCK"
 }
 
 cmd_editor() {
@@ -624,5 +782,7 @@ case "${1:-}" in
   shell)   shift; cmd_shell "$@" ;;
   logs)    cmd_logs ;;
   status)  cmd_status ;;
-  *) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1 ;;
+  ssh-auth)  shift; cmd_ssh_auth "$@" ;;
+  ssh-agent) cmd_ssh_agent_service ;;
+  *) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1 ;;
 esac

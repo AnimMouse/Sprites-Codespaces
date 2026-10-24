@@ -77,12 +77,26 @@ container and exits if the container stops, so the sprite restarts it.
 show. The local CLI **refuses** to work on a sprite whose URL auth is
 `public`. Keep that check.
 
-### Credentials: `GH_TOKEN`, not SSH keys
+### Credentials: `GH_TOKEN` for HTTPS, optional `SSH_KEY` through an agent on the sprite
 A git credential helper that only reads `$GH_TOKEN`, set with
-`git config --system`, works in any image with or without `gh`. This replaces
-the sibling repo's SSH key and agent forwarding, because there is no agent to
-forward into a sprite. Commit signing is opt-in with a passphrase-less
-`SIGNING_KEY`.
+`git config --system`, works in any image with or without `gh`. HTTPS remotes
+always use it.
+
+`SSH_KEY` (added 2026-10-25, at the user's request) brings back the sibling
+repo's `ssh-auth`. `sprite exec` cannot forward the PC's agent, so each sprite
+runs an `ssh-agent` service, and `sprite-codespace ssh-auth` loads the key
+into it:
+- The private key goes over `sprite exec --file` into a `mktemp -d` under
+  `/dev/shm`, which is tmpfs, so it never reaches disk or a checkpoint.
+- `ssh-add` prompts on a `--tty` session.
+- The directory is removed by the agent's trap, by the local side, and by a
+  5-minute sweep.
+
+Only the `.pub` persists, in `/opt/codespace/git/ssh_key.pub`. It also signs
+commits, through the agent, unless `SIGNING_KEY` (passphrase-less, copied to
+the sprite) is set. One key does authentication and signing, as in the
+sibling repo. Do not rewrite HTTPS remotes to SSH: `GH_TOKEN` already covers
+them, and the agent is empty after a reboot until `ssh-auth` runs again.
 
 ### Persistence: the whole sprite, plus checkpoints
 There is no `/persist` split. The sprite overlay persists everything, and
@@ -106,12 +120,13 @@ There is no `/persist` split. The sprite overlay persists everything, and
 ## 5. Repository layout
 
 ```
-sprite-codespace      # local CLI: create/new/list/open/shell/sync/rebuild/logs/status/checkpoint/rm
-sprite/codespace      # in-sprite agent: setup/editor/refresh/rebuild/shell/logs/status
+sprite-codespace      # local CLI: create/new/list/open/shell/sync/rebuild/logs/status/checkpoint/ssh-auth/rm
+sprite/codespace      # in-sprite agent: setup/editor/refresh/rebuild/shell/logs/status/ssh-auth/ssh-agent
 config.example        # ~/.config/sprite-codespace/config template
 README.md             # user-facing docs
 CLAUDE.md             # this file: design authority
 HANDOFF.md            # where things stand, what is untested
+.gitignore            # .sprite-codespace/, the per-directory config layer
 ```
 
 On the sprite:
@@ -121,23 +136,35 @@ On the sprite:
 /opt/codespace/state/             name, mode, workspace, remote_user, remote_workspace
 /opt/codespace/config             non-secret settings, printf %q-quoted (sourced)
 /opt/codespace/secrets            KEY=value, 0600 (parsed with jq, never sourced)
-/opt/codespace/git/               signing key, 0700; mounted at /mnt/codespace-git in containers
+/opt/codespace/git/               0700; mounted at /mnt/codespace-git in containers:
+                                    id_signing(.pub)  SIGNING_KEY
+                                    ssh_key.pub       SSH_KEY's public half (never the private)
+                                    known_hosts       GitHub's keys from api.github.com/meta
+/opt/codespace/ssh-agent/         0700, agent.sock; the *directory* is mounted at
+                                  /mnt/codespace-ssh, so a restarted agent's new socket shows up
+/dev/shm/codespace-ssh.XXXXXX/    ssh-auth upload, seconds-lived (tmpfs)
+/etc/ssh/ssh_known_hosts2         copy of git/known_hosts, sprite and container
 /opt/codespace/cache/             code-server tarball cache; mounted at /var/cache/codespace
 /opt/codespace/devcontainer-cli/  devcontainer CLI, own npm prefix
 /var/lib/docker/swapfile          extra swap when SWAP_SIZE is set (ext4, see §7)
 /workspaces/<name>                the checkout
 ~/.codespace-secrets              export lines, 0600, sourced by /etc/profile.d/codespace.sh
 ~/.codespace-inbox/               0700 upload drop; emptied by import_inbox
-/.sprite/logs/services/*.log      service logs (editor, docker)
+/.sprite/logs/services/*.log      service logs (editor, docker, ssh-agent)
 ```
 
-Locally, the config is `~/.config/sprite-codespace/{config,secrets,<name>.secrets}`.
+Locally, the config is `~/.config/sprite-codespace/{config,secrets,<name>.secrets}`,
+plus the same files in `./.sprite-codespace/` (relative to the working
+directory), which are read second and so win. It is a directory with a
+distinctive name, not a bare `./config`, because the CLI *sources* it, and
+`~/.ssh/config` exists.
 
 ---
 
 ## 6. Secrets flow
 
-1. The local CLI merges `secrets` and `<name>.secrets` (later keys win), adds
+1. The local CLI merges, in order, the global and then the local `secrets`,
+   then the global and then the local `<name>.secrets` (later keys win). It adds
    `GH_TOKEN` from `gh auth token` if it is absent, and mirrors it to
    `GITHUB_TOKEN`.
 2. It uploads the result with `sprite exec --file` into
@@ -171,6 +198,10 @@ Locally, the config is `~/.config/sprite-codespace/{config,secrets,<name>.secret
 | **`sprite exec` prints `bind: warning: line editing not enabled`** from the sprite's `.bashrc` | Harmless. Filter it when reading output |
 | **The code-server installer draws a progress bar on stderr** | Send install output to `/opt/codespace/logs/code-server-install.log` |
 | **The sprite root is overlayfs, and swapon refuses files on it.** `/var/lib/docker` is a separate ext4 mount (`/dev/nbd1`) in both modes, even when docker is not installed. Nothing re-runs swapon at boot | `SWAP_SIZE` puts the file at `/var/lib/docker/swapfile`, and `ensure_swap` runs on `setup`, `refresh` and every editor start. A changed size recreates the file, `0` removes it, and failures only warn |
+| **A sprite keeps a TTY exec session alive after its client goes away.** A killed `ssh-auth` left `ssh-add` waiting at its prompt indefinitely, holding the uploaded key, and live sessions can keep a sprite awake | `ssh-add` runs under `timeout --foreground 120`, so the session ends and the trap removes the key directory. Plain `timeout` puts `ssh-add` in a background process group, where reading the terminal stops it with SIGTTIN. Inspect with `sprite sessions -s <sprite> list` and `kill <id>` |
+| **`readpassphrase` flushes pending input** (`TCSAFLUSH`), so a passphrase piped in before the prompt appears is discarded | Only matters for testing. Drive it with `script -qec` and a delay of 15 s or more before writing the passphrase. Real typing is unaffected |
+| **`sprite exec -- swapon ...`** (no shell) reports `executable file /usr/bin/swapon not found`: a bare exec does not search `/usr/sbin` | Wrap one-off commands in `bash -c` |
+| **The devcontainer CLI gives the container user the sprite user's uid** (`node` became 1001), through `updateRemoteUserUID` | This is what lets the container reach the 0700 `/opt/codespace/git` and `/opt/codespace/ssh-agent` mounts. Observed with `javascript-node`. An image that sets `updateRemoteUserUID: false` would lose both |
 | **Open VSX, not the Marketplace** (same as the sibling repo) | Install `customizations.vscode.extensions` one by one and skip failures with a note. The sha256 marker of the customizations avoids reinstalling on every boot |
 
 Carried over from the sibling repo, and still true here: `--remote-env` and
