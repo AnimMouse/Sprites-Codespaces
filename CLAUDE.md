@@ -164,9 +164,15 @@ distinctive name, not a bare `./config`, because the CLI *sources* it, and
 ## 6. Secrets flow
 
 1. The local CLI merges, in order, the global and then the local `secrets`,
-   then the global and then the local `<name>.secrets` (later keys win). It adds
-   `GH_TOKEN` from `gh auth token` if it is absent, and mirrors it to
-   `GITHUB_TOKEN`.
+   then the global and then the local `<name>.secrets` (later keys win). It
+   then resolves **one** GitHub token, first non-empty wins (the user's order,
+   2026-10-25): `GITHUB_TOKEN` in the secrets, `GH_TOKEN` in the secrets,
+   `GITHUB_TOKEN` in the local environment, `GH_TOKEN` in the local
+   environment, then `gh auth token`. Any existing `GH_TOKEN`/`GITHUB_TOKEN`
+   lines are replaced by that one value under both names. Two different
+   values would split identities: the git credential helper reads
+   `GH_TOKEN`, and `gh` prefers `GH_TOKEN` over `GITHUB_TOKEN`. It reports
+   the source, never the value.
 2. It uploads the result with `sprite exec --file` into
    `~/.codespace-inbox` (0700). Values never appear in a command line.
 3. `import_inbox` moves it to `/opt/codespace/secrets` (0600).
@@ -193,7 +199,7 @@ distinctive name, not a bare `./config`, because the CLI *sources* it, and
 | **socat outlives a stopped container** and forwards into nothing | The editor service polls `docker inspect .State.Running` and exits when it is false. The sprite restarts the service, and `container_up` brings everything back (measured: 6 s) |
 | **Only one service may have `http_port`** | One `editor` service. `register_editor_service` deletes and recreates it |
 | **`sprite info` has no `--json`** | Use `sprite --json list` and select by name (`sprite_json`) |
-| **`gh auth token` inside a GitHub Codespace** is that codespace's token, scoped to one repo | Warn when `CODESPACES=true`, and let `GH_TOKEN` in the secrets file override it |
+| **Inside a GitHub Codespace, both `$GITHUB_TOKEN` and `gh auth token`** are that codespace's token, scoped to one repo | Warn when `CODESPACES=true` and the token came from the environment or `gh`. A token in a secrets file outranks both |
 | **Reading the Sprites API token is blocked** for Claude by the auto-mode classifier, so the URL proxy cannot be curl-tested from here | Test the editor inside the sprite (`curl localhost:8080/healthz`) and ask the user to open the URL |
 | **`sprite exec` prints `bind: warning: line editing not enabled`** from the sprite's `.bashrc` | Harmless. Filter it when reading output |
 | **The code-server installer draws a progress bar on stderr** | Send install output to `/opt/codespace/logs/code-server-install.log` |

@@ -68,11 +68,21 @@ EOF
 every terminal. After editing, run `sprite-codespace sync <name>` to push the
 change.
 
-**`GH_TOKEN`** is how git and `gh` authenticate inside a codespace. A git
-credential helper turns it into HTTPS credentials, the way Codespaces uses
-`GITHUB_TOKEN`. If you don't set it, it defaults to `gh auth token` from your
-machine. Inside a GitHub Codespace that token only covers one repo, so in that
-case put a real token in the secrets file.
+**The GitHub token** is how git and `gh` authenticate inside a codespace. A
+git credential helper turns it into HTTPS credentials, the way Codespaces uses
+`GITHUB_TOKEN`. The first of these that is set (and not empty) wins:
+
+1. `GITHUB_TOKEN` in a secrets file
+2. `GH_TOKEN` in a secrets file
+3. `GITHUB_TOKEN` in the environment you run `sprite-codespace` from
+4. `GH_TOKEN` in the environment you run `sprite-codespace` from
+5. your machine's `gh` login (`gh auth token`)
+
+The codespace gets the winner as both `GITHUB_TOKEN` and `GH_TOKEN`, so git
+and `gh` always act as the same identity. `create` and `sync` say which source
+they used. Inside a GitHub Codespace, 3–5 are that codespace's own token,
+which only covers one repo. The script warns about this; put a real token in
+a secrets file.
 
 ### SSH key: `ssh-auth`
 

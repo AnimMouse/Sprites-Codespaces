@@ -35,6 +35,7 @@ where things stand and what has not been proven yet.
 | `SSH_KEY` + `ssh-auth`, native | Passphrase prompt through `--tty`, then `Identity added`, `status` shows `unlocked`, a second run says already unlocked, `/dev/shm` left empty. In the shell: `SSH_AUTH_SOCK` set, `ssh-add -l` lists the key, `git commit` is SSH-signed, and `ssh -o BatchMode=yes -T git@github.com` gets past host-key checking (the test key is not on GitHub, so it then gets `Permission denied`, as expected) |
 | `SSH_KEY` + `ssh-auth`, devcontainer (`vscode-remote-try-node`) | Same results inside the container. The container user `node` is uid 1001, which settles the `updateRemoteUserUID` assumption below |
 | Abandoned `ssh-auth` (client killed at the prompt) | The session and the key directory were both gone 140 s later, through the 2-minute timeout |
+| GitHub token precedence | Local harness only: `stage_secrets` with fake tokens and a fake `gh`, for every rung, empty values, the Codespace warning and no token at all. The sprite side is unchanged and receives the same `KEY=value` lines as before; not yet run against a sprite |
 | shellcheck | Clean on both scripts |
 
 ---

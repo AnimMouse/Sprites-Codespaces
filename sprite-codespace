@@ -118,24 +118,50 @@ stage_secrets() {
            END { for (i = 1; i <= n; i++) print v[order[i]] }' "$out" > "$out.tmp"
   mv "$out.tmp" "$out"; chmod 600 "$out"
 
-  if ! grep -q '^GH_TOKEN=' "$out"; then
-    local tok=""
-    command -v gh >/dev/null && tok=$(gh auth token 2>/dev/null || true)
-    if [ -n "$tok" ]; then
-      if [ "${CODESPACES:-}" = true ]; then
-        note "warning: this gh token is a GitHub Codespace's, scoped to one repo."
-        note "         Put a broader one in $CONF_DIR/secrets as GH_TOKEN=..."
-      fi
-      printf 'GH_TOKEN=%s\n' "$tok" >> "$out"
-    else
-      note "note: no GH_TOKEN (gh not logged in) — private repos and git push will not work inside"
-    fi
+  # One GitHub token, first found wins:
+  #   1. GITHUB_TOKEN in the secrets files   3. GITHUB_TOKEN in this environment
+  #   2. GH_TOKEN in the secrets files       4. GH_TOKEN in this environment
+  #                                          5. `gh auth token`
+  # and the codespace gets it under both names. git's credential helper reads
+  # GH_TOKEN, and gh prefers GH_TOKEN over GITHUB_TOKEN, so two different
+  # values would mean git and gh quietly acting as different identities.
+  # An empty value counts as unset, at every step.
+  local tok="" src="" gh_tok=""
+  if   tok=$(secret_value GITHUB_TOKEN "$out") && [ -n "$tok" ]; then src="GITHUB_TOKEN from the secrets file"
+  elif tok=$(secret_value GH_TOKEN "$out")     && [ -n "$tok" ]; then src="GH_TOKEN from the secrets file"
+  elif [ -n "${GITHUB_TOKEN:-}" ]; then tok=$GITHUB_TOKEN; src="GITHUB_TOKEN from your environment"
+  elif [ -n "${GH_TOKEN:-}" ];     then tok=$GH_TOKEN;     src="GH_TOKEN from your environment"
+  else
+    # GH_TOKEN/GITHUB_TOKEN are unset or empty here, so this really is the
+    # stored login, not an environment token echoed back.
+    command -v gh >/dev/null && gh_tok=$(gh auth token 2>/dev/null || true)
+    if [ -n "$gh_tok" ]; then tok=$gh_tok; src="your gh login (gh auth token)"; fi
   fi
-  # GITHUB_TOKEN too, as Codespaces provides it; tools look for either.
-  if ! grep -q '^GITHUB_TOKEN=' "$out" && grep -q '^GH_TOKEN=' "$out"; then
-    local gt; gt=$(sed -n 's/^GH_TOKEN=/GITHUB_TOKEN=/p' "$out" | tail -1)
-    printf '%s\n' "$gt" >> "$out"
+
+  grep -vE '^(GH_TOKEN|GITHUB_TOKEN)=' "$out" > "$out.tmp" || true
+  mv "$out.tmp" "$out"; chmod 600 "$out"
+  if [ -z "$tok" ]; then
+    note "note: no GitHub token (no GITHUB_TOKEN/GH_TOKEN, gh not logged in) — private repos and git push will not work inside"
+    return 0
   fi
+  printf 'GITHUB_TOKEN=%s\nGH_TOKEN=%s\n' "$tok" "$tok" >> "$out"
+  note "GitHub token: $src"
+  # Inside a GitHub Codespace, both the environment's GITHUB_TOKEN and its gh
+  # login are that codespace's own token, scoped to one repo.
+  case "$src" in
+    *secrets*) ;;
+    *) [ "${CODESPACES:-}" = true ] && {
+         note "warning: this is a GitHub Codespace's token, scoped to one repo."
+         note "         Put a broader one in a secrets file as GITHUB_TOKEN=..."
+       } ;;
+  esac
+  return 0
+}
+
+# A KEY's value in a merged secrets file, or failure if the key is absent.
+secret_value() {
+  grep -q "^$1=" "$2" || return 1
+  sed -n "s/^$1=//p" "$2" | tail -1
 }
 
 stage_config() {
