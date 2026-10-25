@@ -36,6 +36,7 @@ where things stand and what has not been proven yet.
 | `SSH_KEY` + `ssh-auth`, devcontainer (`vscode-remote-try-node`) | Same results inside the container. The container user `node` is uid 1001, which settles the `updateRemoteUserUID` assumption below |
 | Abandoned `ssh-auth` (client killed at the prompt) | The session and the key directory were both gone 140 s later, through the 2-minute timeout |
 | GitHub token precedence | Local harness only: `stage_secrets` with fake tokens and a fake `gh`, for every rung, empty values, the Codespace warning and no token at all. The sprite side is unchanged and receives the same `KEY=value` lines as before; not yet run against a sprite |
+| First real use (`cs-ipm-simplified`, 2026-10-26) | Showed three bugs, all fixed and re-tested on a throwaway sprite: commits authored as `Sprite` (the image's `~/.gitconfig`), the private dotfiles clone missing its token, and the install-command typo passing silently. The fourth problem was the config itself: a passphrase-protected key was set as `SIGNING_KEY` instead of `SSH_KEY` |
 | shellcheck | Clean on both scripts |
 
 ---

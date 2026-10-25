@@ -93,7 +93,9 @@ import_inbox() {
   if [ -f "$INBOX/signing_key" ]; then
     install -m 600 "$INBOX/signing_key" "$GITDIR/id_signing"
     ssh-keygen -y -P "" -f "$GITDIR/id_signing" > "$GITDIR/id_signing.pub" 2>/dev/null \
-      || { rm -f "$GITDIR/id_signing" "$GITDIR/id_signing.pub"; note "warning: signing key has a passphrase or is not an SSH key — commit signing skipped"; }
+      || { rm -f "$GITDIR/id_signing" "$GITDIR/id_signing.pub"
+           note "warning: SIGNING_KEY has a passphrase (or is not an SSH key), and nothing here can type it."
+           note "         For a passphrase-protected key, set SSH_KEY instead and run ssh-auth; it signs too."; }
   elif [ -f "$INBOX/no_signing_key" ]; then
     rm -f "$GITDIR/id_signing" "$GITDIR/id_signing.pub"
   fi
@@ -333,19 +335,30 @@ DOTFILES_SCRIPTS="install.sh install bootstrap.sh bootstrap script/bootstrap set
 
 apply_dotfiles_native() {
   [ -n "${DOTFILES_REPOSITORY:-}" ] || return 0
-  local dir="$HOME/dotfiles" url="$DOTFILES_REPOSITORY" s
+  local dir="$HOME/dotfiles" url="$DOTFILES_REPOSITORY"
   case "$url" in *://*|*@*:*) ;; *) url="https://github.com/$url" ;; esac
-  if [ ! -d "$dir/.git" ]; then
-    note "cloning dotfiles $url"
-    git clone -q "$url" "$dir" || { note "warning: dotfiles clone failed"; return 0; }
-  else
-    git -C "$dir" pull -q --ff-only || note "note: could not update dotfiles; using what is there"
-  fi
   (
-    cd "$dir"
-    # Secrets in the environment, as Codespaces gives them to install.sh.
+    # Secrets in the environment before the clone, not just for install.sh:
+    # the credential helper reads GH_TOKEN, and without it a private dotfiles
+    # repo fails with "could not read Username". Codespaces gives install.sh
+    # the same environment.
     eval "$(secrets_exports)"
-    for s in ${DOTFILES_INSTALL_COMMAND:-$DOTFILES_SCRIPTS}; do
+    local s
+    if [ ! -d "$dir/.git" ]; then
+      note "cloning dotfiles $url"
+      git clone -q "$url" "$dir" || { note "warning: dotfiles clone failed"; exit 0; }
+    else
+      git -C "$dir" pull -q --ff-only || note "note: could not update dotfiles; using what is there"
+    fi
+    cd "$dir"
+    # A named command that is not in the repo is almost certainly a typo, so
+    # say so, then behave as Codespaces does without one.
+    local cmd="${DOTFILES_INSTALL_COMMAND:-}"
+    if [ -n "$cmd" ] && [ ! -f "$cmd" ]; then
+      note "warning: DOTFILES_INSTALL_COMMAND='$cmd' is not in the dotfiles repo — trying the usual install scripts"
+      cmd=""
+    fi
+    for s in ${cmd:-$DOTFILES_SCRIPTS}; do
       if [ -f "$s" ]; then
         note "dotfiles: $s"
         chmod +x "$s"; "./$s"; exit
@@ -369,6 +382,16 @@ native_configure() {
   install -m 600 /dev/null "$HOME/.codespace-secrets"
   secrets_exports > "$HOME/.codespace-secrets"
   git_system_script "$GITDIR" | sudo bash
+  # The sprite image ships a ~/.gitconfig with user Sprite <noreply@sprites.dev>,
+  # and global beats the system level written above, so every commit was
+  # authored by "Sprite". Only those exact image defaults are removed: an
+  # identity your dotfiles put in ~/.gitconfig is left to win, as it would.
+  if [ -n "${GIT_NAME:-}" ] && [ "$(git config --global user.name 2>/dev/null)" = Sprite ]; then
+    git config --global --unset user.name
+  fi
+  if [ -n "${GIT_EMAIL:-}" ] && [ "$(git config --global user.email 2>/dev/null)" = noreply@sprites.dev ]; then
+    git config --global --unset user.email
+  fi
   profile_snippet "$name" "$SSH_AGENT_SOCK" | sudo tee /etc/profile.d/codespace.sh >/dev/null
   if ssh_agent_wanted && [ -s "$GITDIR/known_hosts" ]; then
     sudo install -m 644 "$GITDIR/known_hosts" /etc/ssh/ssh_known_hosts2
