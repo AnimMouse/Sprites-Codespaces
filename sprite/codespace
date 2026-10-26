@@ -14,6 +14,7 @@
 #   codespace status            mode, workspace, editor health
 #   codespace ssh-auth [<dir>]  load the uploaded SSH key into the sprite's agent
 #   codespace ssh-agent         the sprite service holding that agent
+#   codespace keepalive         the sprite service behind IDLE_TIMEOUT
 #
 # Two modes:
 #
@@ -588,6 +589,137 @@ container_editor() {
 }
 
 # ---------------------------------------------------------------------------
+# Idle timeout — GitHub Codespaces' "stop after N minutes idle", in reverse
+#
+# A sprite pauses about 30 s after its last activity, and a running service is
+# not activity, so closing the tab froze whatever was building in a terminal.
+# The Sprites Tasks API is the documented way to hold a sprite up: while a task
+# is registered it does not pause. Tasks live at most an hour, so the
+# `keepalive` service renews a 5-minute one every minute for as long as the
+# editor was in use within IDLE_TIMEOUT, then deletes it.
+#
+# "In use" is code-server's own heartbeat, as /healthz reports it. Measured on
+# a sprite: it beats on every real request, and every 60 s while a connection
+# (an open tab's websocket) stays up; polling /healthz itself does *not* beat,
+# so watching it cannot keep itself alive. 127.0.0.1:$EDITOR_PORT is the same
+# editor in both modes, through socat in devcontainer mode.
+#
+# Fails safe: if this service dies or the sprite stops, the task expires on
+# its own within 5 minutes. The loop itself is not activity either, so once
+# the task is gone the sprite pauses with the loop frozen inside it, and picks
+# up where it left off on the next wake.
+
+KEEPALIVE_TASK=codespace-idle
+KEEPALIVE_TTL=5m
+KEEPALIVE_EVERY=60
+# Codespaces allows 5 to 240 minutes. The upper bound is kept, since every
+# minute held is billed; the lower one is not, so short values can be tested.
+IDLE_TIMEOUT_MAX=$((240 * 60))
+
+# IDLE_TIMEOUT in seconds; 0 means off. Codespaces' default is 30 minutes.
+idle_timeout_seconds() {
+  local v="${IDLE_TIMEOUT:-30m}" s
+  case "$v" in
+    0|off) echo 0; return ;;
+  esac
+  if [[ "$v" =~ ^([0-9]+)m$ ]]; then s=$(( 10#${BASH_REMATCH[1]} * 60 ))
+  elif [[ "$v" =~ ^([0-9]+)h$ ]]; then s=$(( 10#${BASH_REMATCH[1]} * 3600 ))
+  else
+    note "warning: IDLE_TIMEOUT='$v' is not a duration — e.g. 30m or 2h, or 0 for off. Using 30m."
+    s=1800
+  fi
+  if [ "$s" -gt "$IDLE_TIMEOUT_MAX" ]; then
+    note "warning: IDLE_TIMEOUT='$v' is over Codespaces' 240m maximum. Using 240m."
+    s=$IDLE_TIMEOUT_MAX
+  fi
+  echo "$s"
+}
+
+sprite_api() {
+  curl -fsS --max-time 5 --unix-socket /.sprite/api.sock \
+    -H "Content-Type: application/json" "$@"
+}
+task_hold()    { sprite_api -X PUT "http://sprite/v1/tasks/$KEEPALIVE_TASK" -d "{\"expire\": \"$KEEPALIVE_TTL\"}" >/dev/null; }
+task_release() { sprite_api -X DELETE "http://sprite/v1/tasks/$KEEPALIVE_TASK" >/dev/null 2>&1 || true; }
+
+# The editor's last heartbeat in epoch seconds; 0 if it has none, or is down.
+editor_heartbeat() {
+  local ms
+  ms=$(curl -fsS --max-time 3 "http://127.0.0.1:$EDITOR_PORT/healthz" 2>/dev/null \
+    | jq -r '.lastHeartbeat // 0' 2>/dev/null) || ms=0
+  [[ "$ms" =~ ^[0-9]+$ ]] || ms=0
+  echo $(( ms / 1000 ))
+}
+
+cmd_keepalive_service() {
+  load_config
+  local timeout last=0 beat now held=0
+  timeout=$(idle_timeout_seconds)
+  if [ "$timeout" = 0 ]; then
+    task_release
+    exit 0
+  fi
+  trap 'task_release; exit 0' TERM INT
+  # A previous run's hold (this service restarted by sync) is dropped, and
+  # re-taken on the first pass below if the editor is in use.
+  task_release
+  while true; do
+    beat=$(editor_heartbeat)
+    # The newest heartbeat ever seen, not just the current one: the editor
+    # restarting (sync, a container restart) resets it to 0, and that must
+    # not count as idle while you are still connected.
+    [ "$beat" -gt "$last" ] && last=$beat
+    now=$(date +%s)
+    if [ "$last" -gt 0 ] && [ $(( now - last )) -lt "$timeout" ]; then
+      if task_hold; then
+        [ "$held" = 1 ] || echo "holding the sprite awake: editor active $(( now - last ))s ago"
+        held=1
+      else
+        echo "warning: could not renew task $KEEPALIVE_TASK"
+      fi
+    elif [ "$held" = 1 ]; then
+      task_release
+      echo "idle for $(( (now - last) / 60 ))m — releasing; the sprite can pause"
+      held=0
+    fi
+    # In the background and waited on, so a TERM from `services stop` runs
+    # the trap now rather than after the sleep, which bash would otherwise
+    # finish first.
+    sleep "$KEEPALIVE_EVERY" & wait $!
+  done
+}
+
+# Registered whenever the timeout is on, and restarted so it rereads the
+# config; deleted, along with any task it held, when the timeout is 0.
+ensure_keepalive() {
+  if [ "$(idle_timeout_seconds)" = 0 ]; then
+    sprite-env services delete keepalive >/dev/null 2>&1 || true
+    task_release
+    return 0
+  fi
+  if sprite-env services get keepalive >/dev/null 2>&1; then
+    sprite-env services restart keepalive >/dev/null 2>&1 || true
+  else
+    sprite-env services create keepalive --cmd /usr/local/bin/codespace \
+      --args keepalive --no-stream >/dev/null
+  fi
+}
+
+keepalive_status() {
+  local timeout beat now
+  timeout=$(idle_timeout_seconds 2>/dev/null)
+  [ "$timeout" = 0 ] && { echo off; return; }
+  beat=$(editor_heartbeat); now=$(date +%s)
+  local held="the sprite can pause"
+  sprite_api "http://sprite/v1/tasks/$KEEPALIVE_TASK" >/dev/null 2>&1 && held="holding the sprite awake"
+  if [ "$beat" = 0 ]; then
+    echo "$(( timeout / 60 ))m; editor not used since it started; $held"
+  else
+    echo "$(( timeout / 60 ))m; editor last active $(( (now - beat) / 60 ))m ago; $held"
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # Commands
 
 register_editor_service() {
@@ -663,6 +795,7 @@ cmd_setup() {
 
   register_editor_service "$mode"
   wait_for_editor
+  ensure_keepalive
   note "ready"
 }
 
@@ -684,6 +817,7 @@ cmd_refresh() {
   # terminals the new environment.
   sprite-env services restart editor >/dev/null
   wait_for_editor
+  ensure_keepalive
 }
 
 cmd_rebuild() {
@@ -735,8 +869,9 @@ cmd_status() {
       agent="locked — run: sprite-codespace ssh-auth $(state_get name)"
     fi
   fi
-  printf 'name:      %s\nmode:      %s\nworkspace: %s\neditor:    %s\nssh key:   %s\n' \
-    "$(state_get name)" "$(state_get mode)" "$(state_get workspace)" "$health" "$agent"
+  load_config
+  printf 'name:      %s\nmode:      %s\nworkspace: %s\neditor:    %s\nssh key:   %s\nidle:      %s\n' \
+    "$(state_get name)" "$(state_get mode)" "$(state_get workspace)" "$health" "$agent" "$(keepalive_status)"
 }
 
 # <dir> is the 0700 tmpfs directory sprite-codespace uploaded key and key.pub
@@ -807,5 +942,6 @@ case "${1:-}" in
   status)  cmd_status ;;
   ssh-auth)  shift; cmd_ssh_auth "$@" ;;
   ssh-agent) cmd_ssh_agent_service ;;
-  *) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1 ;;
+  keepalive) cmd_keepalive_service ;;
+  *) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1 ;;
 esac

@@ -23,7 +23,7 @@ the same model, but nothing runs on your PC.
 | `devcontainer.json` | yes | yes | yes, with the real devcontainer CLI |
 | No `devcontainer.json` | universal image | `base:ubuntu` image | the sprite itself: node, python, go, rust, java, ruby, bun, deno ... |
 | What persists | `/workspaces` | `/persist` | **the whole sprite** and checkpoints |
-| Idle | stops after 30 min | always on | sleeps when nobody is connected and wakes on the next request |
+| Idle | stops after 30 min | always on | stays up 30 min (`IDLE_TIMEOUT`) after you close the tab, then sleeps; wakes on the next request |
 | Secrets | Codespaces secrets | `/persist/codespace/secrets` | `~/.config/sprite-codespace/secrets` |
 | Forwarded ports | `*-3000.app.github.dev` | ports on localhost | `<url>/proxy/3000/` or `sprite proxy 3000` |
 
@@ -176,6 +176,7 @@ sprite-codespace ──sprite exec──▶  /usr/local/bin/codespace  (sprite/c
                                                        the container → socat :8080
                                        docker     (devcontainer mode only)
                                        ssh-agent  (when SSH_KEY is set)
+                                       keepalive  (unless IDLE_TIMEOUT=0)
 ```
 
 - **The URL is the login.** The sprite URL uses `sprite` auth, which means a
@@ -188,8 +189,17 @@ sprite-codespace ──sprite exec──▶  /usr/local/bin/codespace  (sprite/c
   editor service runs `devcontainer up` again, which also runs
   `postStartCommand`. A devcontainer codespace can take a few seconds to
   answer after a cold start, so if the first load fails, refresh.
-  **An open editor tab keeps the sprite awake**, so close the tab when you're
-  done.
+- **Idle timeout.** On its own, a sprite pauses about 30 seconds after the
+  last request, which would freeze a build the moment you close the tab. So,
+  as in Codespaces, it stays up until the editor has been unused for
+  `IDLE_TIMEOUT` (default `30m`, at most `4h`, `0` turns it off), then
+  sleeps. A `keepalive` service holds a [Sprites
+  task](https://docs.sprites.dev/keeping-sprites-running/) while the editor's
+  heartbeat is recent. If that service dies, the hold expires by itself
+  within 5 minutes. "Unused" means no tab open: an open tab counts as in use,
+  as it already kept the sprite awake. `sprite-codespace status <name>` shows
+  where the timer is. Compute is billed while the sprite is awake, so the
+  timeout is a cost, and the reason it has a maximum.
 - **Persistence.** The entire sprite filesystem persists, including `$HOME`,
   installed packages, docker images and `/workspaces/*`, so this is more
   persistent than real Codespaces. `create` takes a checkpoint of the fresh

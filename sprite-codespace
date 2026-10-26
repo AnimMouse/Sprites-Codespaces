@@ -170,7 +170,7 @@ stage_config() {
   GIT_NAME="${GIT_NAME:-$(git config user.name 2>/dev/null || true)}"
   GIT_EMAIL="${GIT_EMAIL:-$(git config user.email 2>/dev/null || true)}"
   for v in GIT_NAME GIT_EMAIL DOTFILES_REPOSITORY DOTFILES_INSTALL_COMMAND \
-           TIMEZONE CODE_SERVER_VERSION DEFAULT_IMAGE SWAP_SIZE; do
+           TIMEZONE CODE_SERVER_VERSION DEFAULT_IMAGE SWAP_SIZE IDLE_TIMEOUT; do
     [ -n "${!v:-}" ] && printf '%s=%q\n' "$v" "${!v}" >> "$out"
   done
   return 0

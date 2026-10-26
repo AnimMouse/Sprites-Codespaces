@@ -37,6 +37,7 @@ where things stand and what has not been proven yet.
 | Abandoned `ssh-auth` (client killed at the prompt) | The session and the key directory were both gone 140 s later, through the 2-minute timeout |
 | GitHub token precedence | Local harness only: `stage_secrets` with fake tokens and a fake `gh`, for every rung, empty values, the Codespace warning and no token at all. The sprite side is unchanged and receives the same `KEY=value` lines as before; not yet run against a sprite |
 | First real use (`cs-ipm-simplified`, 2026-10-26) | Showed three bugs, all fixed and re-tested on a throwaway sprite: commits authored as `Sprite` (the image's `~/.gitconfig`), the private dotfiles clone missing its token, and the install-command typo passing silently. The fourth problem was the config itself: a passphrase-protected key was set as `SIGNING_KEY` instead of `SSH_KEY` |
+| `IDLE_TIMEOUT` (native, set to 3m) | One editor request, then no traffic: the task was renewed each minute, the sprite stayed up the full 3 minutes (a clock service showed no gap), then was released and paused within 10 s. `status` shows the timer. `0` removes the service and the task, and an invalid value warns and uses 30m |
 | shellcheck | Clean on both scripts |
 
 ---
@@ -92,9 +93,11 @@ Built from documentation or reasoning only. Treat these as unproven:
    a codespace for one real private repo with a `devcontainer.json`. That
    covers most of the untested list at once.
 2. Run the local CLI from Git Bash on the Windows PC and fix whatever breaks.
-3. Consider an idle timeout for forgotten browser tabs, which keep a sprite
-   running. Codespaces stops after 30 minutes. One way to do it: have the
-   editor service watch code-server's websocket connections.
+3. Check `IDLE_TIMEOUT` with a real browser tab: the tab's websocket should
+   keep the heartbeat beating, so `status` shows "last active 0m ago" while it
+   is open and counts up after it is closed. Not yet tested: a real tab
+   (activity was simulated with a single request), devcontainer mode (the
+   same `/healthz`, through socat), and a full 30-minute run.
 4. Consider a `gc` like the sibling repo's, for codespaces unused for 30 days.
    Checkpoints and `last_running_at` from `sprite --json list` would be the
    clock.

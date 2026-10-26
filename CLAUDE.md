@@ -121,7 +121,7 @@ There is no `/persist` split. The sprite overlay persists everything, and
 
 ```
 sprite-codespace      # local CLI: create/new/list/open/shell/sync/rebuild/logs/status/checkpoint/ssh-auth/rm
-sprite/codespace      # in-sprite agent: setup/editor/refresh/rebuild/shell/logs/status/ssh-auth/ssh-agent
+sprite/codespace      # in-sprite agent: setup/editor/refresh/rebuild/shell/logs/status/ssh-auth/ssh-agent/keepalive
 config.example        # ~/.config/sprite-codespace/config template
 README.md             # user-facing docs
 CLAUDE.md             # this file: design authority
@@ -150,7 +150,8 @@ On the sprite:
 /workspaces/<name>                the checkout
 ~/.codespace-secrets              export lines, 0600, sourced by /etc/profile.d/codespace.sh
 ~/.codespace-inbox/               0700 upload drop; emptied by import_inbox
-/.sprite/logs/services/*.log      service logs (editor, docker, ssh-agent)
+/.sprite/logs/services/*.log      service logs (editor, docker, ssh-agent, keepalive)
+task codespace-idle               the keepalive's hold (Tasks API), while the editor is in use
 ```
 
 Locally, the config is `~/.config/sprite-codespace/{config,secrets,<name>.secrets}`,
@@ -191,7 +192,10 @@ distinctive name, not a bare `./config`, because the CLI *sources* it, and
 
 | Gotcha | Handling |
 |---|---|
-| **A running service does not keep a sprite awake.** The CLI help says services keep it alive. In practice a sprite with code-server and dockerd running went `warm` after about 1 min idle, then `cold`, and woke on the next request with uptime intact. `cold` was a suspend, not a reboot | No idle-timeout machinery. An **open browser tab** does keep it awake, and the README says so |
+| **A running service does not keep a sprite awake.** The bundled docs and CLI help say services keep it alive. The online docs (docs.sprites.dev, "Lifecycle" and "Keeping a Sprite Running") are right: activity means a command, a session producing output, a connection to the URL, or a service *handling traffic*. Idle for about 30 s → `warm` (suspended, not billed), later `cold` | Holding a sprite up takes the **Tasks API** (`/.sprite/api.sock`, `PUT /v1/tasks/<name>` with `expire` ≤ 1h). `IDLE_TIMEOUT` (default 30m, max 240m, 0 off): the `keepalive` service renews task `codespace-idle` (5 min TTL) every 60 s while code-server's `/healthz` `lastHeartbeat` is within the timeout, then deletes it |
+| **The status from `sprite list` is not a reliable pause signal.** It reported `cold` one second after the keepalive renewed its task, with uptime unchanged | Measure pauses from inside instead: a throwaway service writing `date` every 10 s, then look for gaps. That showed a sprite held for the whole timeout, then paused **within 10 s of the task's delete** |
+| **Service log timestamps are when the log was collected**, which for a line written just before a pause is after the next wake (a 00:12:39 release was stamped 00:16:26) | Don't read pause timing from `/.sprite/logs`. Use the clock-service method |
+| **code-server's heartbeat:** it beats on every real request, and every 60 s while any connection stays open (an open tab's websocket). Polling `/healthz` does **not** beat (`lastHeartbeat` stayed 0 for minutes) | `/healthz` is the activity signal, safe to poll. It resets to 0 when code-server restarts, so the loop tracks the newest value ever seen |
 | **`npm i -g` lands in the active nvm version's directory**, which drops off PATH after `nvm use` | Install the devcontainer CLI with `--prefix /opt/codespace/devcontainer-cli` and symlink it into `/usr/local/bin` |
 | **Exec sessions and services do not pick up supplementary groups** added after boot, so `usermod -aG docker sprite` does nothing and `sg` does not exist | Run `dockerd --group sprite`, so the socket is group-owned by sprite's primary group |
 | **`sprite exec --file` uploads land 0644** and create parent directories | Create a 0700 inbox in a separate `exec` first, then upload into it |

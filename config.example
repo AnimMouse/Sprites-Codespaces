@@ -43,3 +43,9 @@
 # Extra swap at /var/lib/docker/swapfile, re-enabled whenever the editor starts.
 # Change it and `sprite-codespace sync` to resize; 0 removes the file.
 #SWAP_SIZE=2G
+
+# Like Codespaces' idle timeout: how long the sprite stays up after the editor
+# was last used (tab closed), so builds keep running; then it sleeps. Default
+# 30m, max 4h (240m); 0 turns it off, so the sprite sleeps ~30s after you
+# leave. Compute is billed the whole time it is up.
+#IDLE_TIMEOUT=30m
