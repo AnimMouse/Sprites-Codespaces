@@ -38,6 +38,7 @@ where things stand and what has not been proven yet.
 | GitHub token precedence | Local harness only: `stage_secrets` with fake tokens and a fake `gh`, for every rung, empty values, the Codespace warning and no token at all. The sprite side is unchanged and receives the same `KEY=value` lines as before; not yet run against a sprite |
 | First real use (`cs-ipm-simplified`, 2026-10-26) | Showed three bugs, all fixed and re-tested on a throwaway sprite: commits authored as `Sprite` (the image's `~/.gitconfig`), the private dotfiles clone missing its token, and the install-command typo passing silently. The fourth problem was the config itself: a passphrase-protected key was set as `SIGNING_KEY` instead of `SSH_KEY` |
 | `IDLE_TIMEOUT` (native, set to 3m) | One editor request, then no traffic: the task was renewed each minute, the sprite stayed up the full 3 minutes (a clock service showed no gap), then was released and paused within 10 s. `status` shows the timer. `0` removes the service and the task, and an invalid value warns and uses 30m |
+| `sleep` (default 30m timeout) | Editor active, task held → `sleep` → task released, and a clock service showed the pause 53–63 s after the command ended. `status`: "put to sleep 2m ago". One editor request re-armed it (task held, "last active 1m ago"). The open-connection warning shows with a socket held on `:8080` and not without. Untested: whether a real browser tab, once closed, leaves a pooled proxy connection behind that would trigger the warning falsely |
 | shellcheck | Clean on both scripts |
 
 ---

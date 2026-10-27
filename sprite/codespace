@@ -15,6 +15,7 @@
 #   codespace ssh-auth [<dir>]  load the uploaded SSH key into the sprite's agent
 #   codespace ssh-agent         the sprite service holding that agent
 #   codespace keepalive         the sprite service behind IDLE_TIMEOUT
+#   codespace sleep             idle now, until the editor is used again
 #
 # Two modes:
 #
@@ -663,12 +664,17 @@ cmd_keepalive_service() {
   # A previous run's hold (this service restarted by sync) is dropped, and
   # re-taken on the first pass below if the editor is in use.
   task_release
+  local mark
   while true; do
     beat=$(editor_heartbeat)
     # The newest heartbeat ever seen, not just the current one: the editor
     # restarting (sync, a container restart) resets it to 0, and that must
     # not count as idle while you are still connected.
     [ "$beat" -gt "$last" ] && last=$beat
+    # `codespace sleep` marks everything up to now as idle. Only a heartbeat
+    # after the mark, from the editor actually being used again, counts.
+    mark=$(idle_mark)
+    [ "$last" -gt "$mark" ] || last=0
     now=$(date +%s)
     if [ "$last" -gt 0 ] && [ $(( now - last )) -lt "$timeout" ]; then
       if task_hold; then
@@ -706,17 +712,52 @@ ensure_keepalive() {
 }
 
 keepalive_status() {
-  local timeout beat now
+  local timeout beat now mark
   timeout=$(idle_timeout_seconds 2>/dev/null)
   [ "$timeout" = 0 ] && { echo off; return; }
-  beat=$(editor_heartbeat); now=$(date +%s)
+  beat=$(editor_heartbeat); now=$(date +%s); mark=$(idle_mark)
   local held="the sprite can pause"
   sprite_api "http://sprite/v1/tasks/$KEEPALIVE_TASK" >/dev/null 2>&1 && held="holding the sprite awake"
-  if [ "$beat" = 0 ]; then
+  if [ "$mark" -gt 0 ] && [ "$beat" -le "$mark" ]; then
+    echo "$(( timeout / 60 ))m; put to sleep $(( (now - mark) / 60 ))m ago, until the editor is used again; $held"
+  elif [ "$beat" = 0 ]; then
     echo "$(( timeout / 60 ))m; editor not used since it started; $held"
   else
     echo "$(( timeout / 60 ))m; editor last active $(( (now - beat) / 60 ))m ago; $held"
   fi
+}
+
+# When `codespace sleep` last ran, in epoch seconds; 0 if never.
+idle_mark() {
+  local m; m=$(state_get idle_since)
+  [[ "$m" =~ ^[0-9]+$ ]] && echo "$m" || echo 0
+}
+
+# Idle the codespace now instead of waiting out IDLE_TIMEOUT. Nothing to
+# undo: the next real use of the editor is newer than the mark and re-arms
+# the timeout by itself.
+cmd_sleep() {
+  load_config
+  if [ "$(idle_timeout_seconds)" = 0 ]; then
+    note "IDLE_TIMEOUT is off, so nothing is holding the sprite up already"
+    return 0
+  fi
+  state_set idle_since "$(date +%s)"
+  # Restarted rather than signalled: its TERM trap releases the task and it
+  # starts over reading the mark, so no renewal already in flight can land
+  # after the release.
+  sprite-env services restart keepalive >/dev/null 2>&1 || task_release
+  # An open tab is a connection to the editor port, and it re-beats every
+  # 60 s, so it would re-arm the timeout within a minute and keep the sprite
+  # awake on its own regardless. Our own probes are not connections that
+  # outlive the call, so any established one is someone else's.
+  local conns
+  conns=$(ss -Htn state established "( sport = :$EDITOR_PORT )" 2>/dev/null | wc -l)
+  if [ "$conns" -gt 0 ]; then
+    note "warning: an editor tab still seems to be connected — close it, or it re-arms the"
+    note "         timeout within a minute and keeps the sprite awake by itself"
+  fi
+  note "idle now: the sprite pauses within about a minute of this command ending; the next use of the editor re-arms the ${IDLE_TIMEOUT:-30m} timeout"
 }
 
 # ---------------------------------------------------------------------------
@@ -943,5 +984,6 @@ case "${1:-}" in
   ssh-auth)  shift; cmd_ssh_auth "$@" ;;
   ssh-agent) cmd_ssh_agent_service ;;
   keepalive) cmd_keepalive_service ;;
-  *) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1 ;;
+  sleep)     cmd_sleep ;;
+  *) sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1 ;;
 esac

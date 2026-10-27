@@ -129,7 +129,8 @@ sprite-codespace sync repo                # after changing secrets, config or yo
 sprite-codespace rebuild repo             # after changing devcontainer.json
 sprite-codespace checkpoint repo "before upgrade"
 sprite-codespace ssh-auth repo            # unlock SSH_KEY into the sprite's agent
-sprite-codespace status repo              # mode, editor health, SSH key locked or not
+sprite-codespace status repo              # mode, editor health, SSH key locked or not, idle timer
+sprite-codespace sleep repo               # idle it now instead of waiting out IDLE_TIMEOUT
 sprite-codespace logs repo                # when the URL doesn't load
 sprite-codespace rm repo                  # destroy it (asks first)
 ```
@@ -200,6 +201,13 @@ sprite-codespace ──sprite exec──▶  /usr/local/bin/codespace  (sprite/c
   as it already kept the sprite awake. `sprite-codespace status <name>` shows
   where the timer is. Compute is billed while the sprite is awake, so the
   timeout is a cost, and the reason it has a maximum.
+
+  To skip the wait, close the tab and run `sprite-codespace sleep <name>`.
+  The hold is released, and the sprite pauses within about a minute.
+  Anything running in its terminals is frozen, not killed, and resumes when
+  the sprite wakes. There's nothing to undo: the next time you use the editor,
+  the timeout is back on. Close the tab first, because an open tab counts as
+  use; the command warns if one still seems connected.
 - **Persistence.** The entire sprite filesystem persists, including `$HOME`,
   installed packages, docker images and `/workspaces/*`, so this is more
   persistent than real Codespaces. `create` takes a checkpoint of the fresh

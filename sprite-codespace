@@ -16,6 +16,7 @@
 #   sprite-codespace logs <name>                 editor logs, when the URL fails
 #   sprite-codespace checkpoint <name> [comment] snapshot the whole sprite
 #   sprite-codespace ssh-auth <name>             unlock SSH_KEY into the sprite's ssh-agent
+#   sprite-codespace sleep <name>                idle it now, until the editor is used again
 #   sprite-codespace rm <name>                   destroy the sprite (asks first)
 #
 # <repo> is owner/repo, github.com/owner/repo, or any git URL.
@@ -40,7 +41,7 @@ PREFIX_DEFAULT=cs-
 die() { echo "sprite-codespace: $*" >&2; exit 1; }
 note() { echo "==> $*" >&2; }
 
-usage() { sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//' >&2; exit "${1:-1}"; }
+usage() { sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//' >&2; exit "${1:-1}"; }
 
 # Every config directory, global first, so the local one's values win.
 conf_dirs() { echo "$CONF_DIR"; [ -z "$LOCAL_CONF_DIR" ] || echo "$LOCAL_CONF_DIR"; }
@@ -389,6 +390,7 @@ case "${1:-}" in
   rebuild)    shift; cmd_passthrough rebuild "$@" ;;
   logs)       shift; cmd_passthrough logs "$@" ;;
   status)     shift; cmd_passthrough status "$@" ;;
+  sleep)      shift; cmd_passthrough sleep "$@" ;;
   checkpoint) shift; cmd_checkpoint "$@" ;;
   ssh-auth)   shift; cmd_ssh_auth "$@" ;;
   rm|delete)  shift; cmd_rm "$@" ;;

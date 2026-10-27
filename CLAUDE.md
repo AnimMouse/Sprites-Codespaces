@@ -120,8 +120,8 @@ There is no `/persist` split. The sprite overlay persists everything, and
 ## 5. Repository layout
 
 ```
-sprite-codespace      # local CLI: create/new/list/open/shell/sync/rebuild/logs/status/checkpoint/ssh-auth/rm
-sprite/codespace      # in-sprite agent: setup/editor/refresh/rebuild/shell/logs/status/ssh-auth/ssh-agent/keepalive
+sprite-codespace      # local CLI: create/new/list/open/shell/sync/rebuild/logs/status/sleep/checkpoint/ssh-auth/rm
+sprite/codespace      # in-sprite agent: setup/editor/refresh/rebuild/shell/logs/status/sleep/ssh-auth/ssh-agent/keepalive
 config.example        # ~/.config/sprite-codespace/config template
 README.md             # user-facing docs
 CLAUDE.md             # this file: design authority
@@ -133,7 +133,8 @@ On the sprite:
 
 ```
 /usr/local/bin/codespace          the agent
-/opt/codespace/state/             name, mode, workspace, remote_user, remote_workspace
+/opt/codespace/state/             name, mode, workspace, remote_user, remote_workspace,
+                                  idle_since (set by `sleep`: heartbeats up to it are ignored)
 /opt/codespace/config             non-secret settings, printf %q-quoted (sourced)
 /opt/codespace/secrets            KEY=value, 0600 (parsed with jq, never sourced)
 /opt/codespace/git/               0700; mounted at /mnt/codespace-git in containers:
@@ -194,6 +195,7 @@ distinctive name, not a bare `./config`, because the CLI *sources* it, and
 |---|---|
 | **A running service does not keep a sprite awake.** The bundled docs and CLI help say services keep it alive. The online docs (docs.sprites.dev, "Lifecycle" and "Keeping a Sprite Running") are right: activity means a command, a session producing output, a connection to the URL, or a service *handling traffic*. Idle for about 30 s → `warm` (suspended, not billed), later `cold` | Holding a sprite up takes the **Tasks API** (`/.sprite/api.sock`, `PUT /v1/tasks/<name>` with `expire` ≤ 1h). `IDLE_TIMEOUT` (default 30m, max 240m, 0 off): the `keepalive` service renews task `codespace-idle` (5 min TTL) every 60 s while code-server's `/healthz` `lastHeartbeat` is within the timeout, then deletes it |
 | **The status from `sprite list` is not a reliable pause signal.** It reported `cold` one second after the keepalive renewed its task, with uptime unchanged | Measure pauses from inside instead: a throwaway service writing `date` every 10 s, then look for gaps. That showed a sprite held for the whole timeout, then paused **within 10 s of the task's delete** |
+| **`sprite-codespace sleep`** (manual idle) | Writes `state/idle_since` and **restarts** the keepalive service, rather than just deleting the task. The restart's TERM trap releases the task, and the new loop reads the mark before it can renew, so no renewal can land after the release. Heartbeats at or before the mark are ignored, so the next real editor use re-arms it with nothing to undo. An open tab is detected as an established connection on `:8080` (our own probes don't outlive their call), and only warned about, because the tab would re-arm it within a minute. Measured: the sprite paused 53–63 s after the command's session ended, not 30 s |
 | **Service log timestamps are when the log was collected**, which for a line written just before a pause is after the next wake (a 00:12:39 release was stamped 00:16:26) | Don't read pause timing from `/.sprite/logs`. Use the clock-service method |
 | **code-server's heartbeat:** it beats on every real request, and every 60 s while any connection stays open (an open tab's websocket). Polling `/healthz` does **not** beat (`lastHeartbeat` stayed 0 for minutes) | `/healthz` is the activity signal, safe to poll. It resets to 0 when code-server restarts, so the loop tracks the newest value ever seen |
 | **`npm i -g` lands in the active nvm version's directory**, which drops off PATH after `nvm use` | Install the devcontainer CLI with `--prefix /opt/codespace/devcontainer-cli` and symlink it into `/usr/local/bin` |
