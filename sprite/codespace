@@ -182,36 +182,77 @@ install_devcontainer_cli() {
   sudo ln -sf "$ROOT/devcontainer-cli/bin/devcontainer" /usr/local/bin/devcontainer
 }
 
-# Extra swap, on top of whatever the sprite platform provides. On
-# /var/lib/docker because that is an ext4 mount in both modes, and swapon
-# refuses files on the overlay root. Nothing re-runs swapon at boot on a
-# sprite (no fstab, no systemd), so the editor service calls this on every
-# start. Never fatal: a codespace without the extra swap still works.
-SWAPFILE=/var/lib/docker/swapfile
+# Extra swap, on top of whatever the sprite platform provides.
+#
+# On /tmp: a local ext4 disk (/dev/vdb, "local-storage", about 20G). Not the
+# overlay root, where swapon refuses files, and no longer /var/lib/docker:
+# that is ext4 too, but on /dev/nbd0, a network block device, and swapping
+# to it made sprites unstable in real use. Local storage may not follow a
+# sprite to another host, and nothing re-runs swapon at boot (no fstab, no
+# systemd), so the editor service calls this on every start and the file is
+# recreated whenever it is missing. Never fatal: a codespace without the extra
+# swap still works.
+SWAPFILE=/tmp/swapfile
+# Where SWAP_SIZE used to put it. Swapped off and deleted on sight.
+SWAPFILE_OLD=/var/lib/docker/swapfile
+# /tmp's disk also carries /tmp itself and the sprite's service logs, and when
+# it filled up in a test the sprite stopped accepting connections ("Storage
+# not ready") and did not recover. So the swap file must always leave room
+# to spare, and is skipped with a warning when it would not.
+SWAP_MAX=8G
+SWAP_HEADROOM=2G
 
+swap_remove() {
+  sudo test -e "$1" || sudo test -L "$1" || return 0
+  note "removing $1"
+  # swapoff pulls its pages back into RAM, and can fail for want of it; the
+  # kernel then refuses to delete a file still in use. Neither is fatal.
+  sudo swapoff "$1" 2>/dev/null || true
+  sudo rm -f "$1" 2>/dev/null || note "warning: could not remove $1 (still in use as swap?)"
+}
+
+# The new file first, the old one after, so pages leaving the old swap have
+# somewhere to go besides RAM.
 ensure_swap() {
-  local size="${SWAP_SIZE:-}" want have
+  ensure_swap_file
+  swap_remove "$SWAPFILE_OLD"
+  return 0
+}
+
+ensure_swap_file() {
+  local size="${SWAP_SIZE:-}" want have max avail
   [ -n "$size" ] || return 0
   if [ "$size" = 0 ]; then
-    if sudo test -e "$SWAPFILE"; then
-      note "removing $SWAPFILE"
-      sudo swapoff "$SWAPFILE" 2>/dev/null || true
-      sudo rm -f "$SWAPFILE"
-    fi
+    swap_remove "$SWAPFILE"
     return 0
   fi
   case "$size" in
     [1-9]*[MG]) want=$(numfmt --from=iec "$size" 2>/dev/null) || { note "warning: SWAP_SIZE='$size' is not a size — e.g. 2G"; return 0; } ;;
     *) note "warning: SWAP_SIZE='$size' is not a size — e.g. 2G or 512M"; return 0 ;;
   esac
+  max=$(numfmt --from=iec "$SWAP_MAX")
+  if [ "$want" -gt "$max" ]; then
+    note "warning: SWAP_SIZE='$size' is over the $SWAP_MAX maximum. Using $SWAP_MAX."
+    size=$SWAP_MAX; want=$max
+  fi
+
+  # /tmp is world-writable and fs.protected_symlinks is 0 on a sprite, so a
+  # link here would have root fallocate and mkswap whatever it points at.
+  if sudo test -L "$SWAPFILE"; then
+    note "warning: $SWAPFILE is a symlink — not touching it; remove it and run sync"
+    return 0
+  fi
 
   have=$(sudo stat -c %s "$SWAPFILE" 2>/dev/null || echo 0)
   if [ "$have" != "$want" ]; then
+    # The file being replaced frees its own space, so it counts as available.
+    avail=$(( $(df --output=avail -B1 /tmp | tail -1) + have ))
+    if [ "$avail" -lt $(( want + $(numfmt --from=iec "$SWAP_HEADROOM") )) ]; then
+      note "warning: /tmp has $(numfmt --to=iec "$avail") free; ${size} of swap plus $SWAP_HEADROOM spare does not fit — no extra swap"
+      return 0
+    fi
     note "creating ${size} swap at $SWAPFILE"
-    sudo swapoff "$SWAPFILE" 2>/dev/null || true
-    # mkdir, not install -d: never change the mode of docker's own directory.
-    sudo mkdir -p /var/lib/docker
-    sudo rm -f "$SWAPFILE"
+    swap_remove "$SWAPFILE" 2>/dev/null
     { sudo fallocate -l "$size" "$SWAPFILE" \
         && sudo chmod 600 "$SWAPFILE" \
         && sudo mkswap -q "$SWAPFILE" >/dev/null; } \

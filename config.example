@@ -40,8 +40,10 @@
 # Image for --devcontainer on a repo with no devcontainer.json.
 #DEFAULT_IMAGE=mcr.microsoft.com/devcontainers/base:ubuntu26.04
 
-# Extra swap at /var/lib/docker/swapfile, re-enabled whenever the editor starts.
-# Change it and `sprite-codespace sync` to resize; 0 removes the file.
+# Extra swap at /tmp/swapfile (the sprite's local disk, about 20G), re-enabled
+# and recreated if missing whenever the editor starts. At most 8G, and skipped
+# with a warning unless 2G of /tmp stays free: a full /tmp disk stops the
+# sprite. Change it and `sprite-codespace sync` to resize; 0 removes the file.
 #SWAP_SIZE=2G
 
 # Like Codespaces' idle timeout: how long the sprite stays up after the editor
