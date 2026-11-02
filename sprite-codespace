@@ -41,7 +41,10 @@ PREFIX_DEFAULT=cs-
 die() { echo "sprite-codespace: $*" >&2; exit 1; }
 note() { echo "==> $*" >&2; }
 
-usage() { sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//' >&2; exit "${1:-1}"; }
+# The header comment is the usage text: from line 2 to the first line that is
+# not a comment, so it cannot drift out of step with the header as a fixed
+# line range did (it once printed `set -euo pipefail`).
+usage() { awk 'NR > 1 && !/^#/ { exit } NR > 1' "$0" | sed 's/^# \{0,1\}//' >&2; exit "${1:-1}"; }
 
 # Every config directory, global first, so the local one's values win.
 conf_dirs() { echo "$CONF_DIR"; [ -z "$LOCAL_CONF_DIR" ] || echo "$LOCAL_CONF_DIR"; }

@@ -1026,5 +1026,6 @@ case "${1:-}" in
   ssh-agent) cmd_ssh_agent_service ;;
   keepalive) cmd_keepalive_service ;;
   sleep)     cmd_sleep ;;
-  *) sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1 ;;
+  # The whole header comment, up to the first non-comment line.
+  *) awk 'NR > 1 && !/^#/ { exit } NR > 1' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1 ;;
 esac
