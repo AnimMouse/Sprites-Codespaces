@@ -155,7 +155,7 @@ On the sprite:
 task codespace-idle               the keepalive's hold (Tasks API), while the editor is in use
 ```
 
-Locally, the config is `~/.config/sprite-codespace/{config,secrets,<name>.secrets}`,
+Locally, the config is `~/.config/sprite-codespace/{config,secrets,repos/<owner>/<repo>.secrets,<name>.secrets}`,
 plus the same files in `./.sprite-codespace/` (relative to the working
 directory), which are read second and so win. It is a directory with a
 distinctive name, not a bare `./config`, because the CLI *sources* it, and
@@ -165,8 +165,15 @@ distinctive name, not a bare `./config`, because the CLI *sources* it, and
 
 ## 6. Secrets flow
 
-1. The local CLI merges, in order, the global and then the local `secrets`,
-   then the global and then the local `<name>.secrets` (later keys win). It
+1. The local CLI merges three scopes, broadest first, each global then local
+   (later keys win): `secrets`, then `repos/<owner>/<repo>.secrets` (added
+   2026-11-04 so parallel codespaces of one repo share a repo-scoped PAT),
+   then `<name>.secrets`. The repo key is the URL's last two path segments,
+   `.git` dropped, `..` and odd characters refused, and it is matched
+   case-insensitively with `find -ipath`. `create` takes it from its
+   argument. `sync` reads `git remote get-url origin` from the workspace in
+   the same `sprite exec` that makes the inbox, so codespaces made before
+   this need no new state. It prints the files used, never values. It
    then resolves **one** GitHub token, first non-empty wins (the user's order,
    2026-10-25): `GITHUB_TOKEN` in the secrets, `GH_TOKEN` in the secrets,
    `GITHUB_TOKEN` in the local environment, `GH_TOKEN` in the local

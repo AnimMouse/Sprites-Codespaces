@@ -40,6 +40,7 @@ where things stand and what has not been proven yet.
 | `IDLE_TIMEOUT` (native, set to 3m) | One editor request, then no traffic: the task was renewed each minute, the sprite stayed up the full 3 minutes (a clock service showed no gap), then was released and paused within 10 s. `status` shows the timer. `0` removes the service and the task, and an invalid value warns and uses 30m |
 | `sleep` (default 30m timeout) | Editor active, task held → `sleep` → task released, and a clock service showed the pause 53–63 s after the command ended. `status`: "put to sleep 2m ago". One editor request re-armed it (task held, "last active 1m ago"). The open-connection warning shows with a socket held on `:8080` and not without. Untested: whether a real browser tab, once closed, leaves a pooled proxy connection behind that would trigger the warning falsely |
 | `SWAP_SIZE` on `/tmp` (2026-10-28) | Moved off the network disk `/var/lib/docker` after instability. On throwaway sprites: an active old 2G swap was replaced (new `/tmp/swapfile` first, then old removed); 16G was capped to 8G; with 6.2G free an 8G request warned and changed nothing; a symlink at the path was refused and its target untouched; `0` removed the file. Filling `/tmp` completely broke a test sprite for good (`Storage not ready`) |
+| Per-repo secrets (`repos/<owner>/<repo>.secrets`) | Local harness: URL forms (https, `git@`, trailing slash, bare `github.com/x/y`) give `owner/repo`; `..` and junk give nothing; case-insensitive match; precedence global < repo < name; a repo's `GITHUB_TOKEN` becomes the token; another repo doesn't see the file. On a sprite: `create` (repo from the URL) and `sync` (repo from the checkout's `origin`) both applied the repo file, and a `<name>.secrets` still overrode it |
 | shellcheck | Clean on both scripts |
 
 ---
@@ -71,8 +72,8 @@ Built from documentation or reasoning only. Treat these as unproven:
   has been seen yet.
 - **A real key pushing over SSH**, as opposed to getting past host-key
   checking.
-- **`TIMEZONE`, `CODE_SERVER_VERSION`, `DEFAULT_IMAGE`, `DEFAULT_MODE`, `SPRITE_ORG`**,
-  and per-codespace `<name>.secrets` overrides.
+- **`CODE_SERVER_VERSION`, `DEFAULT_IMAGE`, `SPRITE_ORG`.** (Per-codespace and
+  per-repo secrets are now tested, as are `TIMEZONE` and `DEFAULT_MODE` in real use.)
 - **A real sprite reboot.** `cold` turned out to be a suspend, so the
   boot-time service restart (dockerd, then editor, then `devcontainer up` on a
   stopped container) was only simulated with `docker stop` plus a service

@@ -99,28 +99,65 @@ normalize_url() {
   esac
 }
 
-# KEY=value lines: the secrets files, then <name>.secrets on top, like
-# Codespaces' user secrets with a per-repo override. Each step goes global
-# then local, so the most specific file wins. GH_TOKEN defaults to
-# `gh auth token`, which is what lets git push and gh work inside.
+# owner/repo from a git URL, for repos/<owner>/<repo>.secrets: the last two
+# path segments, with .git dropped. https://github.com/a/b.git and
+# git@github.com:a/b both give a/b. Empty for anything else, and for names
+# that are not plain path segments, since this becomes a file path.
+repo_key() {
+  local key
+  key=$(printf '%s' "$1" | sed -E 's#/+$##; s#\.git$##; s#^.*[/:]([^/:]+)/([^/:]+)$#\1/\2#')
+  [[ "$key" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] && [[ "$key" != *..* ]] && echo "$key"
+  return 0
+}
+
+# A repo's secrets file in config dir $1. GitHub names are case-insensitive,
+# so the file is matched case-insensitively too: Arkos-Technologies/ipm-simplified
+# finds repos/arkos-technologies/IPM-Simplified.secrets.
+repo_secrets_file() {
+  local d="$1" key="$2"
+  [ -n "$key" ] && [ -d "$d/repos" ] || return 0
+  find "$d/repos" -mindepth 2 -maxdepth 2 -type f -ipath "$d/repos/$key.secrets" 2>/dev/null | head -1
+}
+
+# KEY=value lines, like Codespaces secrets, from the broadest to the most
+# specific; later keys win:
+#   secrets                        every codespace
+#   repos/<owner>/<repo>.secrets   every codespace of that repo (Codespaces'
+#                                  per-repository secrets), e.g. a
+#                                  fine-grained PAT for just that repo
+#   <name>.secrets                 one codespace (sprite) only
+# Each level is read from the global config dir, then the local one. The
+# GitHub token is then resolved from the merged result (below).
 stage_secrets() {
-  local name="$1" out="$2" f d
+  local name="$1" out="$2" key="${3:-}" f d used=""
   local -a files=()
   while IFS= read -r d; do files+=("$d/secrets"); done < <(conf_dirs)
+  while IFS= read -r d; do
+    f=$(repo_secrets_file "$d" "$key")
+    [ -n "$f" ] && files+=("$f")
+  done < <(conf_dirs)
   while IFS= read -r d; do files+=("$d/$name.secrets"); done < <(conf_dirs)
   : > "$out"; chmod 600 "$out"
   for f in "${files[@]}"; do
     [ -r "$f" ] || continue
+    case "$f" in
+      "$PWD"/*)  used="$used ./${f#"$PWD"/}" ;;
+      "$HOME"/*) used="$used ~/${f#"$HOME"/}" ;;
+      *)         used="$used $f" ;;
+    esac
     case "$(stat -c %a "$f" 2>/dev/null || stat -f %Lp "$f")" in
       600|400) ;;
       *) note "warning: $f is readable by others; chmod 600 it" ;;
     esac
     grep -E '^[A-Za-z_][A-Za-z0-9_]*=' "$f" >> "$out" || true
   done
-  # Later lines win, so the per-codespace file overrides the global one.
+  # Later lines win, so the more specific file overrides the broader one.
   awk -F= '{ v[$1] = $0; if (!($1 in seen)) { seen[$1]; order[++n] = $1 } }
            END { for (i = 1; i <= n; i++) print v[order[i]] }' "$out" > "$out.tmp"
   mv "$out.tmp" "$out"; chmod 600 "$out"
+  # Which files, never which values: so you can see that a repo's scoped
+  # secrets were the ones applied.
+  note "secrets from:${used:- (none)}${key:+ (repo $key)}"
 
   # One GitHub token, first found wins:
   #   1. GITHUB_TOKEN in the secrets files   3. GITHUB_TOKEN in this environment
@@ -183,12 +220,23 @@ stage_config() {
 # Uploads config, secrets and signing key into a 0700 inbox on the sprite,
 # plus the agent itself. `codespace` moves them into place on its next run.
 push_files() {
-  local sname="$1" name="$2" stage
+  local sname="$1" name="$2" url="${3:-}" stage origin
+  # The inbox, and in the same round trip the checkout's origin URL, which is
+  # what decides the repo's secrets on a sync. Read live rather than recorded
+  # at create, so codespaces made before repo secrets existed work too. Empty
+  # on a sprite not set up yet; create passes the URL it was given instead.
+  # Single-quoted on purpose: it expands on the sprite, not here.
+  # shellcheck disable=SC2016
+  origin=$(sp exec -s "$sname" --no-stdin -- bash -c '
+    install -d -m 700 /home/sprite/.codespace-inbox
+    ws=$(cat /opt/codespace/state/workspace 2>/dev/null) || exit 0
+    git -C "$ws" remote get-url origin 2>/dev/null || true' 2>/dev/null | tr -d '\r' | tail -1)
+  [ -n "$url" ] && [ "$url" != - ] && origin=$url
   stage=$(mktemp -d); chmod 700 "$stage"
   # shellcheck disable=SC2064
   trap "rm -rf '$stage'" EXIT
   stage_config "$stage/config"
-  stage_secrets "$name" "$stage/secrets"
+  stage_secrets "$name" "$stage/secrets" "$(repo_key "$origin")"
   local -a files=(--file "$AGENT:/tmp/codespace-agent"
     --file "$stage/config:/home/sprite/.codespace-inbox/config"
     --file "$stage/secrets:/home/sprite/.codespace-inbox/secrets")
@@ -209,7 +257,6 @@ push_files() {
     : > "$stage/no_ssh_key"
     files+=(--file "$stage/no_ssh_key:/home/sprite/.codespace-inbox/no_ssh_key")
   fi
-  sp exec -s "$sname" --no-stdin -- install -d -m 700 /home/sprite/.codespace-inbox
   PUSH_ARGS=("${files[@]}")
 }
 
@@ -257,7 +304,7 @@ cmd_create() {
   fi
   require_private_url "$sname"
 
-  push_files "$sname" "$name"
+  push_files "$sname" "$name" "$url"
   agent "$sname" setup "$url" "$name" "$mode"
 
   note "checkpointing the fresh codespace"

@@ -64,8 +64,34 @@ SSH_ANIMMOZ_KEY=...
 EOF
 ```
 
-`<name>.secrets` overrides `secrets` for one codespace. Secrets reach `postCreateCommand`, the dotfiles install script, and
-every terminal. After editing, run `sprite-codespace sync <name>` to push the
+Secrets come in three scopes. A narrower scope overrides a broader one key by
+key:
+
+| File | Applies to |
+|---|---|
+| `secrets` | every codespace |
+| `repos/<owner>/<repo>.secrets` | every codespace of that repo, like Codespaces' per-repository secrets |
+| `<name>.secrets` | one codespace (one sprite) |
+
+The per-repo scope is the one for parallel codespaces of the same repo, such
+as `sprites-codespaces-1` and `sprites-codespaces-2` for side-by-side Claude Code
+sessions. One file covers all of them, so a fine-grained PAT limited to that
+repo can live there:
+
+```bash
+mkdir -p ~/.config/sprite-codespace/repos/AnimMouse
+install -m 600 /dev/null ~/.config/sprite-codespace/repos/AnimMouse/sprites-codespaces.secrets
+echo 'GITHUB_TOKEN=github_pat_...' >> ~/.config/sprite-codespace/repos/AnimMouse/sprites-codespaces.secrets
+```
+
+The repo is the last two path segments of its git URL, matched without regard
+to case. `create` takes it from the URL you give, and `sync` reads it from
+the codespace's own `origin`, so existing codespaces pick it up too. Each
+scope can live in `~/.config/sprite-codespace/` or `./.sprite-codespace/`, or
+both. `create` and `sync` list the files they used, never their values.
+
+Secrets reach `postCreateCommand`, the dotfiles install script, and every
+terminal. After editing, run `sprite-codespace sync <name>` to push the
 change.
 
 **The GitHub token** is how git and `gh` authenticate inside a codespace. A
