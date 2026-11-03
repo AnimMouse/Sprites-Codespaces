@@ -27,8 +27,9 @@
 # as a *Signing key*. Leave both unset to not sign.
 #SIGNING_KEY=$HOME/.ssh/id_ed25519_signing
 
-# Dotfiles, exactly as in Codespaces settings. Private repos work: the clone
-# uses GH_TOKEN.
+# Dotfiles, exactly as in Codespaces settings. A private repo is cloned with
+# DOTFILES_TOKEN from your secrets if set (a PAT that can read it, kept out of
+# the codespace's shells), else with the codespace's GitHub token.
 #DOTFILES_REPOSITORY=AnimMouse/dotfiles-codespaces
 #DOTFILES_INSTALL_COMMAND=install.sh
 

@@ -94,6 +94,21 @@ Secrets reach `postCreateCommand`, the dotfiles install script, and every
 terminal. After editing, run `sprite-codespace sync <name>` to push the
 change.
 
+**`DOTFILES_TOKEN`** is the exception. With a repo-scoped PAT as the
+codespace's token, a private dotfiles repo can't be cloned, because that PAT
+can't read it. Put a token that can read your dotfiles repo in `secrets` as
+`DOTFILES_TOKEN=...`:
+
+- It's used only to clone and update the dotfiles, on the sprite.
+- It never reaches a terminal, `install.sh`, or the dev container, so the
+  codespace still exposes only the repo-scoped PAT. In devcontainer mode the
+  sprite fetches the dotfiles and the container clones that local copy.
+- Without it, dotfiles are cloned with the codespace's GitHub token, as
+  before.
+
+A fine-grained PAT with read-only *Contents* on just the dotfiles repo is
+enough.
+
 **The GitHub token** is how git and `gh` authenticate inside a codespace. A
 git credential helper turns it into HTTPS credentials, the way Codespaces uses
 `GITHUB_TOKEN`. The first of these that is set (and not empty) wins:

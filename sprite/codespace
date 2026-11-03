@@ -55,6 +55,9 @@ CONTAINER_CACHE=/var/cache/codespace
 SSH_AGENT_DIR=$ROOT/ssh-agent
 SSH_AGENT_SOCK=$SSH_AGENT_DIR/agent.sock
 CONTAINER_SSH_DIR=/mnt/codespace-ssh
+# Devcontainer mode's dotfiles checkout, fetched on the sprite and mounted.
+DOTFILES_DIR=$ROOT/dotfiles
+CONTAINER_DOTFILES_DIR=/mnt/codespace-dotfiles
 
 die() { echo "codespace: $*" >&2; exit 1; }
 note() { echo "==> $*" >&2; }
@@ -80,7 +83,14 @@ secrets_json() {
     | from_entries' < "$SECRETS"
 }
 
-secrets_exports() { secrets_json | jq -r 'to_entries[] | "export \(.key)=\(.value|@sh)"'; }
+# Secrets that reach shells, install.sh and the dev container. DOTFILES_TOKEN
+# is held back: it is often broader than a codespace's repo-scoped PAT (a
+# private dotfiles repo is not the project's repo), and only this agent's own
+# dotfiles fetch needs it. Exporting it would undo the scoping.
+PRIVATE_SECRETS='["DOTFILES_TOKEN"]'
+secrets_public_json() { secrets_json | jq --argjson p "$PRIVATE_SECRETS" 'with_entries(select(.key as $k | $p | index($k) | not))'; }
+secrets_exports() { secrets_public_json | jq -r 'to_entries[] | "export \(.key)=\(.value|@sh)"'; }
+secret_get() { secrets_json | jq -r --arg k "$1" '.[$k] // empty'; }
 
 # ---------------------------------------------------------------------------
 # Inbox: sprite-codespace uploads config, secrets and the optional signing key
@@ -376,23 +386,36 @@ check_timezone() {
 # exists, or else symlink every top-level dotfile into $HOME.
 DOTFILES_SCRIPTS="install.sh install bootstrap.sh bootstrap script/bootstrap setup.sh setup script/setup"
 
+# Clone, or update, DOTFILES_REPOSITORY into $1, on the sprite. The token is
+# DOTFILES_TOKEN when set, else the codespace's own GH_TOKEN: a repo-scoped
+# fine-grained PAT cannot read a private dotfiles repo, and DOTFILES_TOKEN is
+# how one can be given without handing it to every shell. It is passed only
+# to these git commands, through the same GH_TOKEN-reading credential helper.
+# Returns non-zero only if there is no checkout to use at all.
+fetch_dotfiles() {
+  local dir="$1" url="$DOTFILES_REPOSITORY" tok src=DOTFILES_TOKEN
+  case "$url" in *://*|*@*:*) ;; *) url="https://github.com/$url" ;; esac
+  tok=$(secret_get DOTFILES_TOKEN)
+  [ -n "$tok" ] || { tok=$(secret_get GH_TOKEN); src="the GitHub token"; }
+  if [ ! -d "$dir/.git" ]; then
+    note "cloning dotfiles $url${tok:+ (with $src)}"
+    GH_TOKEN="$tok" git clone -q "$url" "$dir" \
+      || { note "warning: dotfiles clone failed — a private repo needs DOTFILES_TOKEN, or a GITHUB_TOKEN that can read it"; return 1; }
+  else
+    GH_TOKEN="$tok" git -C "$dir" pull -q --ff-only \
+      || note "note: could not update dotfiles; using what is there"
+  fi
+}
+
 apply_dotfiles_native() {
   [ -n "${DOTFILES_REPOSITORY:-}" ] || return 0
-  local dir="$HOME/dotfiles" url="$DOTFILES_REPOSITORY"
-  case "$url" in *://*|*@*:*) ;; *) url="https://github.com/$url" ;; esac
+  local dir="$HOME/dotfiles"
+  fetch_dotfiles "$dir" || return 0
   (
-    # Secrets in the environment before the clone, not just for install.sh:
-    # the credential helper reads GH_TOKEN, and without it a private dotfiles
-    # repo fails with "could not read Username". Codespaces gives install.sh
-    # the same environment.
+    # Secrets in install.sh's environment, as Codespaces gives them, minus
+    # DOTFILES_TOKEN (see PRIVATE_SECRETS).
     eval "$(secrets_exports)"
     local s
-    if [ ! -d "$dir/.git" ]; then
-      note "cloning dotfiles $url"
-      git clone -q "$url" "$dir" || { note "warning: dotfiles clone failed"; exit 0; }
-    else
-      git -C "$dir" pull -q --ff-only || note "note: could not update dotfiles; using what is there"
-    fi
     cd "$dir"
     # A named command that is not in the repo is almost certainly a typo, so
     # say so, then behave as Codespaces does without one.
@@ -480,10 +503,13 @@ container_up() {
   # it on later needs only a sync, not a rebuild. Created first: docker would
   # otherwise create a missing bind source itself, owned by root.
   install -d -m 700 "$SSH_AGENT_DIR"
+  # Same for the dotfiles checkout, fetched here on the sprite (below).
+  install -d -m 700 "$DOTFILES_DIR"
   local -a args=(up --workspace-folder "$ws" --id-label "codespace=$name"
     --mount "type=bind,source=$CACHE,target=$CONTAINER_CACHE"
     --mount "type=bind,source=$GITDIR,target=/mnt/codespace-git"
-    --mount "type=bind,source=$SSH_AGENT_DIR,target=$CONTAINER_SSH_DIR")
+    --mount "type=bind,source=$SSH_AGENT_DIR,target=$CONTAINER_SSH_DIR"
+    --mount "type=bind,source=$DOTFILES_DIR,target=$CONTAINER_DOTFILES_DIR")
   [ "$recreate" = recreate ] && args+=(--remove-existing-container)
 
   if [ ! -f "$ws/.devcontainer/devcontainer.json" ] && [ ! -f "$ws/.devcontainer.json" ]; then
@@ -497,18 +523,32 @@ container_up() {
   fi
 
   # Secrets reach postCreateCommand and the dotfiles install through
-  # --secrets-file. GH_TOKEN is among them, and the helper below turns it into
-  # git credentials, so a private dotfiles repo clones over https.
+  # --secrets-file, minus DOTFILES_TOKEN. GH_TOKEN is among them, and the
+  # helper below turns it into git credentials for the project's own repos.
   local sfile
   sfile=$(mktemp); chmod 600 "$sfile"
-  secrets_json > "$sfile"
+  secrets_public_json > "$sfile"
   args+=(--secrets-file "$sfile"
-    --remote-env "GIT_CONFIG_COUNT=1"
+    --remote-env "GIT_CONFIG_COUNT=2"
     --remote-env "GIT_CONFIG_KEY_0=credential.https://github.com.helper"
-    --remote-env "GIT_CONFIG_VALUE_0=$GIT_CRED_HELPER")
+    --remote-env "GIT_CONFIG_VALUE_0=$GIT_CRED_HELPER"
+    --remote-env "GIT_CONFIG_KEY_1=safe.directory"
+    --remote-env "GIT_CONFIG_VALUE_1=$CONTAINER_DOTFILES_DIR")
+  # Dotfiles are fetched on the sprite, with DOTFILES_TOKEN if there is one,
+  # and the CLI clones that mounted checkout: it takes a path starting with
+  # / as-is (only owner/repo is expanded to a GitHub URL). So no dotfiles
+  # credential ever enters the container. Fetched only when there is no
+  # checkout yet or on a rebuild, as the CLI installs dotfiles once per
+  # container anyway. safe.directory above: the mount is owned by the sprite
+  # user, which a container user other than uid 1001 is not.
   if [ -n "${DOTFILES_REPOSITORY:-}" ]; then
-    args+=(--dotfiles-repository "$DOTFILES_REPOSITORY")
-    [ -n "${DOTFILES_INSTALL_COMMAND:-}" ] && args+=(--dotfiles-install-command "$DOTFILES_INSTALL_COMMAND")
+    if [ ! -d "$DOTFILES_DIR/.git" ] || [ "$recreate" = recreate ]; then
+      fetch_dotfiles "$DOTFILES_DIR" || true
+    fi
+    if [ -d "$DOTFILES_DIR/.git" ]; then
+      args+=(--dotfiles-repository "$CONTAINER_DOTFILES_DIR")
+      [ -n "${DOTFILES_INSTALL_COMMAND:-}" ] && args+=(--dotfiles-install-command "$DOTFILES_INSTALL_COMMAND")
+    fi
   fi
 
   note "devcontainer up ($name)"

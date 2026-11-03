@@ -145,6 +145,9 @@ On the sprite:
                                   /mnt/codespace-ssh, so a restarted agent's new socket shows up
 /dev/shm/codespace-ssh.XXXXXX/    ssh-auth upload, seconds-lived (tmpfs)
 /etc/ssh/ssh_known_hosts2         copy of git/known_hosts, sprite and container
+/opt/codespace/dotfiles/          devcontainer mode's dotfiles checkout, fetched on the sprite with
+                                  DOTFILES_TOKEN; mounted at /mnt/codespace-dotfiles, which the
+                                  CLI clones as --dotfiles-repository (native uses ~/dotfiles)
 /opt/codespace/cache/             code-server tarball cache; mounted at /var/cache/codespace
 /opt/codespace/devcontainer-cli/  devcontainer CLI, own npm prefix
 /tmp/swapfile                     extra swap when SWAP_SIZE is set (local ext4 /dev/vdb, ≤ 8G, see §7)
@@ -182,6 +185,20 @@ distinctive name, not a bare `./config`, because the CLI *sources* it, and
    values would split identities: the git credential helper reads
    `GH_TOKEN`, and `gh` prefers `GH_TOKEN` over `GITHUB_TOKEN`. It reports
    the source, never the value.
+   **`DOTFILES_TOKEN`** (2026-11-04) is the one secret that is stored but
+   never exported (`PRIVATE_SECRETS` in the agent). A repo-scoped PAT
+   cannot read a private dotfiles repo, so `fetch_dotfiles` uses
+   `DOTFILES_TOKEN`, else `GH_TOKEN`, by setting `GH_TOKEN` for just its own
+   `git clone`/`pull`. Every export path goes through `secrets_public_json`:
+   `~/.codespace-secrets`, native `install.sh`, the container's
+   `--secrets-file`, and the container's `~/.codespace-secrets`. In
+   devcontainer mode the CLI never fetches dotfiles itself: the sprite
+   fetches into `/opt/codespace/dotfiles`, which is mounted, and the CLI is
+   given the mount path. It uses a path starting with `/` as-is (it only
+   expands `owner/repo`, in `DN()` of the bundle), and `safe.directory` is
+   set through `--remote-env` for container users other than uid 1001. A
+   git URL-scoped credential helper was tried first and rejected: it matches
+   the exact URL only, so `repo` and `repo.git` differ.
 2. It uploads the result with `sprite exec --file` into
    `~/.codespace-inbox` (0700). Values never appear in a command line.
 3. `import_inbox` moves it to `/opt/codespace/secrets` (0600).
