@@ -1,7 +1,8 @@
 {
   "permissions": {
     "deny": [
-      "Read(/.sprite-codespace/**)"
+      "Read(/.sprite-codespace/**)",
+      "Read(~/.config/sprite-codespace/**)"
     ]
   }
 }
