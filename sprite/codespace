@@ -330,10 +330,12 @@ ensure_github_known_hosts() {
 # ---------------------------------------------------------------------------
 # Git, shell environment, dotfiles — shared by both modes
 
-# A credential helper that needs nothing but $GH_TOKEN in the environment, so
+# A credential helper that needs nothing but a token in the environment, so
 # it works in any image, with or without gh. The same trick Codespaces uses.
+# GH_TOKEN first, then GITHUB_TOKEN: gh's own order, so git and gh always
+# act as the same identity, whichever names the secrets set.
 # shellcheck disable=SC2016
-GIT_CRED_HELPER='!f() { test "$1" = get && test -n "$GH_TOKEN" && echo username=x-access-token && echo "password=$GH_TOKEN"; }; f'
+GIT_CRED_HELPER='!f() { t="${GH_TOKEN:-$GITHUB_TOKEN}"; test "$1" = get && test -n "$t" && echo username=x-access-token && echo "password=$t"; }; f'
 
 # Prints shell commands that configure git system-wide. Run on the sprite in
 # native mode and inside the container in devcontainer mode; --system so a
@@ -387,20 +389,22 @@ check_timezone() {
 DOTFILES_SCRIPTS="install.sh install bootstrap.sh bootstrap script/bootstrap setup.sh setup script/setup"
 
 # Clone, or update, DOTFILES_REPOSITORY into $1, on the sprite. The token is
-# DOTFILES_TOKEN when set, else the codespace's own GH_TOKEN: a repo-scoped
+# DOTFILES_TOKEN when set, else the codespace's own GitHub token (GH_TOKEN,
+# then GITHUB_TOKEN, as the credential helper picks it): a repo-scoped
 # fine-grained PAT cannot read a private dotfiles repo, and DOTFILES_TOKEN is
 # how one can be given without handing it to every shell. It is passed only
-# to these git commands, through the same GH_TOKEN-reading credential helper.
+# to these git commands, as GH_TOKEN, which the credential helper reads first.
 # Returns non-zero only if there is no checkout to use at all.
 fetch_dotfiles() {
   local dir="$1" url="$DOTFILES_REPOSITORY" tok src=DOTFILES_TOKEN
   case "$url" in *://*|*@*:*) ;; *) url="https://github.com/$url" ;; esac
   tok=$(secret_get DOTFILES_TOKEN)
   [ -n "$tok" ] || { tok=$(secret_get GH_TOKEN); src="the GitHub token"; }
+  [ -n "$tok" ] || tok=$(secret_get GITHUB_TOKEN)
   if [ ! -d "$dir/.git" ]; then
     note "cloning dotfiles $url${tok:+ (with $src)}"
     GH_TOKEN="$tok" git clone -q "$url" "$dir" \
-      || { note "warning: dotfiles clone failed — a private repo needs DOTFILES_TOKEN, or a GITHUB_TOKEN that can read it"; return 1; }
+      || { note "warning: dotfiles clone failed — a private repo needs DOTFILES_TOKEN, or a GitHub token that can read it"; return 1; }
   else
     GH_TOKEN="$tok" git -C "$dir" pull -q --ff-only \
       || note "note: could not update dotfiles; using what is there"
@@ -444,7 +448,7 @@ apply_dotfiles_native() {
 native_configure() {
   local name="$1"
   check_timezone
-  # The secrets file doubles as gh's login: GH_TOKEN is what gh reads first.
+  # The secrets file doubles as gh's login: gh reads GH_TOKEN, then GITHUB_TOKEN.
   install -m 600 /dev/null "$HOME/.codespace-secrets"
   secrets_exports > "$HOME/.codespace-secrets"
   git_system_script "$GITDIR" | sudo bash
@@ -523,8 +527,8 @@ container_up() {
   fi
 
   # Secrets reach postCreateCommand and the dotfiles install through
-  # --secrets-file, minus DOTFILES_TOKEN. GH_TOKEN is among them, and the
-  # helper below turns it into git credentials for the project's own repos.
+  # --secrets-file, minus DOTFILES_TOKEN. The GitHub token is among them, and
+  # the helper below turns it into git credentials for the project's own repos.
   local sfile
   sfile=$(mktemp); chmod 600 "$sfile"
   secrets_public_json > "$sfile"

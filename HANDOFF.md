@@ -42,6 +42,7 @@ where things stand and what has not been proven yet.
 | `SWAP_SIZE` on `/tmp` (2026-10-28) | Moved off the network disk `/var/lib/docker` after instability. On throwaway sprites: an active old 2G swap was replaced (new `/tmp/swapfile` first, then old removed); 16G was capped to 8G; with 6.2G free an 8G request warned and changed nothing; a symlink at the path was refused and its target untouched; `0` removed the file. Filling `/tmp` completely broke a test sprite for good (`Storage not ready`) |
 | Per-repo secrets (`repos/<owner>/<repo>.secrets`) | Local harness: URL forms (https, `git@`, trailing slash, bare `github.com/x/y`) give `owner/repo`; `..` and junk give nothing; case-insensitive match; precedence global < repo < name; a repo's `GITHUB_TOKEN` becomes the token; another repo doesn't see the file. On a sprite: `create` (repo from the URL) and `sync` (repo from the checkout's `origin`) both applied the repo file, and a `<name>.secrets` still overrode it |
 | `DOTFILES_TOKEN` (2026-11-04) | Native: stored in `/opt/codespace/secrets`, absent from `~/.codespace-secrets`. With a stand-in `git`, the clone got `DOTFILES_TOKEN`, and `GH_TOKEN` once it was removed. Devcontainer (`vscode-remote-try-node`): the sprite fetched the dotfiles, the container's `~/dotfiles` came from `/mnt/codespace-dotfiles`, and the container has `GH_TOKEN` but not `DOTFILES_TOKEN`. Untested: a real private dotfiles repo with a real PAT, which needs the user's tokens |
+| Token names (2026-11-14) | Local harness: each row of the precedence table, including an environment `GH_TOKEN` dropped against a secrets-file `GITHUB_TOKEN`, an empty secrets value falling through, and both names from a secrets file both passed. Credential helper: `GH_TOKEN`, else `GITHUB_TOKEN`, else nothing (no prompt). On a sprite with only an environment `GITHUB_TOKEN`: the shell has `GITHUB_TOKEN` and no `GH_TOKEN`, git's helper returns it, and `gh auth status` reports `(GITHUB_TOKEN)` |
 | shellcheck | Clean on both scripts |
 
 ---
@@ -92,7 +93,7 @@ Built from documentation or reasoning only. Treat these as unproven:
 
 ## Suggested next steps
 
-1. Put a broad `GH_TOKEN` and the dotfiles secrets in
+1. Put a broad `GITHUB_TOKEN` and the dotfiles secrets in
    `~/.config/sprite-codespace/secrets`, set `DOTFILES_REPOSITORY`, and create
    a codespace for one real private repo with a `devcontainer.json`. That
    covers most of the untested list at once.

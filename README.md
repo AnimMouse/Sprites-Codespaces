@@ -111,19 +111,29 @@ enough.
 
 **The GitHub token** is how git and `gh` authenticate inside a codespace. A
 git credential helper turns it into HTTPS credentials, the way Codespaces uses
-`GITHUB_TOKEN`. The first of these that is set (and not empty) wins:
+`GITHUB_TOKEN`. Inside the codespace, git and `gh` both read `GH_TOKEN` first
+and `GITHUB_TOKEN` second, so they always act as the same identity. Tokens
+reach the codespace under the name they were given:
 
-1. `GITHUB_TOKEN` in a secrets file
-2. `GH_TOKEN` in a secrets file
-3. `GITHUB_TOKEN` in the environment you run `sprite-codespace` from
-4. `GH_TOKEN` in the environment you run `sprite-codespace` from
-5. your machine's `gh` login (`gh auth token`)
+| Source, in order of precedence | Lands in the codespace as |
+|---|---|
+| 1. `GH_TOKEN` in a secrets file | `GH_TOKEN` |
+| 2. `GITHUB_TOKEN` in a secrets file | `GITHUB_TOKEN` |
+| 3. `GH_TOKEN` in the environment you run `sprite-codespace` from | `GH_TOKEN` |
+| 4. `GITHUB_TOKEN` in that environment | `GITHUB_TOKEN` |
+| 5. your machine's `gh` login (`gh auth token`) | `GITHUB_TOKEN` |
 
-The codespace gets the winner as both `GITHUB_TOKEN` and `GH_TOKEN`, so git
-and `gh` always act as the same identity. `create` and `sync` say which source
-they used. Inside a GitHub Codespace, 3–5 are that codespace's own token,
-which only covers one repo. The script warns about this; put a real token in
-a secrets file.
+- Tokens from your environment (3, 4) are used only when no secrets file sets
+  either name, so they can never override one that does.
+- `gh auth token` (5) is used only when nothing above it is set.
+- An empty value counts as unset.
+- If a secrets file sets both names, both go through, and `GH_TOKEN` is the
+  one in use.
+
+`create` and `sync` say which names were set and from where, never the
+values. Inside a GitHub Codespace, 3–5 are that codespace's own token, which
+only covers one repo. The script warns about this; put a real token in a
+secrets file.
 
 ### SSH key: `ssh-auth`
 

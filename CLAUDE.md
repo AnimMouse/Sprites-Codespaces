@@ -77,10 +77,10 @@ container and exits if the container stops, so the sprite restarts it.
 show. The local CLI **refuses** to work on a sprite whose URL auth is
 `public`. Keep that check.
 
-### Credentials: `GH_TOKEN` for HTTPS, optional `SSH_KEY` through an agent on the sprite
-A git credential helper that only reads `$GH_TOKEN`, set with
-`git config --system`, works in any image with or without `gh`. HTTPS remotes
-always use it.
+### Credentials: a GitHub token for HTTPS, optional `SSH_KEY` through an agent on the sprite
+A git credential helper that reads `${GH_TOKEN:-$GITHUB_TOKEN}` (gh's own
+order), set with `git config --system`, works in any image with or without
+`gh`. HTTPS remotes always use it.
 
 `SSH_KEY` (added 2026-10-25, at the user's request) brings back the sibling
 repo's `ssh-auth`. `sprite exec` cannot forward the PC's agent, so each sprite
@@ -95,7 +95,7 @@ into it:
 Only the `.pub` persists, in `/opt/codespace/git/ssh_key.pub`. It also signs
 commits, through the agent, unless `SIGNING_KEY` (passphrase-less, copied to
 the sprite) is set. One key does authentication and signing, as in the
-sibling repo. Do not rewrite HTTPS remotes to SSH: `GH_TOKEN` already covers
+sibling repo. Do not rewrite HTTPS remotes to SSH: the GitHub token already covers
 them, and the agent is empty after a reboot until `ssh-auth` runs again.
 
 ### Persistence: the whole sprite, plus checkpoints
@@ -177,18 +177,24 @@ distinctive name, not a bare `./config`, because the CLI *sources* it, and
    argument. `sync` reads `git remote get-url origin` from the workspace in
    the same `sprite exec` that makes the inbox, so codespaces made before
    this need no new state. It prints the files used, never values. It
-   then resolves **one** GitHub token, first non-empty wins (the user's order,
-   2026-10-25): `GITHUB_TOKEN` in the secrets, `GH_TOKEN` in the secrets,
-   `GITHUB_TOKEN` in the local environment, `GH_TOKEN` in the local
-   environment, then `gh auth token`. Any existing `GH_TOKEN`/`GITHUB_TOKEN`
-   lines are replaced by that one value under both names. Two different
-   values would split identities: the git credential helper reads
-   `GH_TOKEN`, and `gh` prefers `GH_TOKEN` over `GITHUB_TOKEN`. It reports
-   the source, never the value.
+   then places the GitHub token(s) **under the name they were given** (the
+   user's table, 2026-11-14, replacing the earlier "one token under both
+   names"). In order: `GH_TOKEN` in the secrets → `GH_TOKEN`; `GITHUB_TOKEN`
+   in the secrets → `GITHUB_TOKEN`; `GH_TOKEN` in the local environment →
+   `GH_TOKEN`; `GITHUB_TOKEN` in the local environment → `GITHUB_TOKEN`;
+   `gh auth token` → `GITHUB_TOKEN`. On the sprite, gh and the credential
+   helper both read `GH_TOKEN` first, so the precedence holds only if a
+   lower source can never place a `GH_TOKEN` above a higher `GITHUB_TOKEN`.
+   Hence: the environment is used only when the secrets set neither name
+   (the user's exception for an environment `GH_TOKEN` against a secrets
+   `GITHUB_TOKEN`); an environment `GITHUB_TOKEN` is likewise dropped when
+   the secrets have a `GH_TOKEN`, because it could never be used; and `gh`
+   is used only when nothing above it is set. It reports names and sources,
+   never values.
    **`DOTFILES_TOKEN`** (2026-11-04) is the one secret that is stored but
    never exported (`PRIVATE_SECRETS` in the agent). A repo-scoped PAT
    cannot read a private dotfiles repo, so `fetch_dotfiles` uses
-   `DOTFILES_TOKEN`, else `GH_TOKEN`, by setting `GH_TOKEN` for just its own
+   `DOTFILES_TOKEN`, else `GH_TOKEN`, else `GITHUB_TOKEN`, by setting `GH_TOKEN` for just its own
    `git clone`/`pull`. Every export path goes through `secrets_public_json`:
    `~/.codespace-secrets`, native `install.sh`, the container's
    `--secrets-file`, and the container's `~/.codespace-secrets`. In
@@ -266,6 +272,6 @@ probing `/healthz` over HTTP, never with `pgrep`.
   every checkpoint with it.
 - Comments explain *why*, as in the sibling repo. Match its tone.
 - Never print secret values, not even while debugging. Test for presence
-  instead (`test -n "$GH_TOKEN" && echo present`).
+  instead (`test -n "${GH_TOKEN:-$GITHUB_TOKEN}" && echo present`).
 - If something in §3 looks wrong given new evidence, say so and explain the
   tradeoff. Don't silently substitute an alternative.

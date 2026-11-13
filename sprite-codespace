@@ -159,41 +159,55 @@ stage_secrets() {
   # secrets were the ones applied.
   note "secrets from:${used:- (none)}${key:+ (repo $key)}"
 
-  # One GitHub token, first found wins:
-  #   1. GITHUB_TOKEN in the secrets files   3. GITHUB_TOKEN in this environment
-  #   2. GH_TOKEN in the secrets files       4. GH_TOKEN in this environment
-  #                                          5. `gh auth token`
-  # and the codespace gets it under both names. git's credential helper reads
-  # GH_TOKEN, and gh prefers GH_TOKEN over GITHUB_TOKEN, so two different
-  # values would mean git and gh quietly acting as different identities.
-  # An empty value counts as unset, at every step.
-  local tok="" src="" gh_tok=""
-  if   tok=$(secret_value GITHUB_TOKEN "$out") && [ -n "$tok" ]; then src="GITHUB_TOKEN from the secrets file"
-  elif tok=$(secret_value GH_TOKEN "$out")     && [ -n "$tok" ]; then src="GH_TOKEN from the secrets file"
-  elif [ -n "${GITHUB_TOKEN:-}" ]; then tok=$GITHUB_TOKEN; src="GITHUB_TOKEN from your environment"
-  elif [ -n "${GH_TOKEN:-}" ];     then tok=$GH_TOKEN;     src="GH_TOKEN from your environment"
+  # GitHub tokens, each kept under the name it was given (the user's table,
+  # 2026-11-14):
+  #   1. GH_TOKEN in the secrets files       -> GH_TOKEN
+  #   2. GITHUB_TOKEN in the secrets files   -> GITHUB_TOKEN
+  #   3. GH_TOKEN in this environment        -> GH_TOKEN
+  #   4. GITHUB_TOKEN in this environment    -> GITHUB_TOKEN
+  #   5. `gh auth token`                     -> GITHUB_TOKEN
+  # On the sprite, gh and the git credential helper both read GH_TOKEN first
+  # and GITHUB_TOKEN second, so whichever name is set highest in this list
+  # is the one in use. That only holds if a lower step can never place a
+  # GH_TOKEN over a higher GITHUB_TOKEN, so the environment (3, 4) is used
+  # only when the secrets files have no token at all, and gh's login (5) only
+  # when nothing above did. An empty value counts as unset, at every step.
+  local s_gh s_github gh_tok="" from_gh="" from_github=""
+  s_gh=$(secret_value GH_TOKEN "$out" || true)
+  s_github=$(secret_value GITHUB_TOKEN "$out" || true)
+  grep -vE '^(GH_TOKEN|GITHUB_TOKEN)=' "$out" > "$out.tmp" || true
+  mv "$out.tmp" "$out"; chmod 600 "$out"
+
+  if [ -n "$s_gh" ] || [ -n "$s_github" ]; then
+    [ -n "$s_gh" ]     && { printf 'GH_TOKEN=%s\n' "$s_gh" >> "$out";         from_gh="the secrets file"; }
+    [ -n "$s_github" ] && { printf 'GITHUB_TOKEN=%s\n' "$s_github" >> "$out"; from_github="the secrets file"; }
+  elif [ -n "${GH_TOKEN:-}" ] || [ -n "${GITHUB_TOKEN:-}" ]; then
+    [ -n "${GH_TOKEN:-}" ]     && { printf 'GH_TOKEN=%s\n' "$GH_TOKEN" >> "$out";         from_gh="your environment"; }
+    [ -n "${GITHUB_TOKEN:-}" ] && { printf 'GITHUB_TOKEN=%s\n' "$GITHUB_TOKEN" >> "$out"; from_github="your environment"; }
   else
     # GH_TOKEN/GITHUB_TOKEN are unset or empty here, so this really is the
     # stored login, not an environment token echoed back.
     command -v gh >/dev/null && gh_tok=$(gh auth token 2>/dev/null || true)
-    if [ -n "$gh_tok" ]; then tok=$gh_tok; src="your gh login (gh auth token)"; fi
+    [ -n "$gh_tok" ] && { printf 'GITHUB_TOKEN=%s\n' "$gh_tok" >> "$out"; from_github="your gh login (gh auth token)"; }
   fi
 
-  grep -vE '^(GH_TOKEN|GITHUB_TOKEN)=' "$out" > "$out.tmp" || true
-  mv "$out.tmp" "$out"; chmod 600 "$out"
-  if [ -z "$tok" ]; then
-    note "note: no GitHub token (no GITHUB_TOKEN/GH_TOKEN, gh not logged in) — private repos and git push will not work inside"
+  if [ -z "$from_gh$from_github" ]; then
+    note "note: no GitHub token (no GH_TOKEN/GITHUB_TOKEN, gh not logged in) — private repos and git push will not work inside"
     return 0
   fi
-  printf 'GITHUB_TOKEN=%s\nGH_TOKEN=%s\n' "$tok" "$tok" >> "$out"
-  note "GitHub token: $src"
-  # Inside a GitHub Codespace, both the environment's GITHUB_TOKEN and its gh
-  # login are that codespace's own token, scoped to one repo.
-  case "$src" in
+  # Names and sources, never values.
+  if [ -n "$from_gh" ]; then
+    note "GitHub token: GH_TOKEN from $from_gh${from_github:+ (GITHUB_TOKEN from $from_github is also set, but GH_TOKEN is the one git and gh use)}"
+  else
+    note "GitHub token: GITHUB_TOKEN from $from_github"
+  fi
+  # Inside a GitHub Codespace, both the environment's tokens and its gh login
+  # are that codespace's own token, scoped to one repo.
+  case "$from_gh$from_github" in
     *secrets*) ;;
     *) [ "${CODESPACES:-}" = true ] && {
          note "warning: this is a GitHub Codespace's token, scoped to one repo."
-         note "         Put a broader one in a secrets file as GITHUB_TOKEN=..."
+         note "         Put a broader one in a secrets file as GH_TOKEN=... or GITHUB_TOKEN=..."
        } ;;
   esac
   return 0
